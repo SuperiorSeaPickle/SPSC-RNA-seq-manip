@@ -4,6 +4,8 @@ import pyarrow.parquet as pq
 from pathlib import Path
 import matplotlib.path as mpath
 
+#testing change
+
 class cell:
     def __init__(self, id):
         self.id = id
@@ -116,8 +118,9 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
         )
 
     delete_file(trns_seleced_path)
-
-    print("cell attributation saved as:    " + Path(trns_seleced_path).parent + r"\trns_with_cellID.parquet")
+    trns_seleced_path = Path(trns_seleced_path).parent + r"\trns_with_cellID.parquet"
+    print("cell attributation saved as:    " + trns_seleced_path)
+    return trns_seleced_path
     
 
 
