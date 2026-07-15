@@ -2,36 +2,43 @@ import pandas as pd
 import plotly.express as px
 import pyarrow.parquet as pq
 from pathlib import Path
-import matplotlib.path as mpath
+from shapely.geometry import Polygon
+from shapely.geometry import Point
+from shapely.strtree import STRtree
+import pickle
+import time
 
-#testing change
-
+DATA_DIR = r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs"
 class cell:
-    def __init__(self, id):
+    def __init__(self, id, coords):
         self.id = id
-        self.boundry = None
+        self.boundry = Polygon(coords)
 
 def selected_to_tmp(source_parquet, output_dir, selected_columns):
+    import gc
     # 1. Open the source file metadata stream
     source_file = pq.ParquetFile(source_parquet)
 
     # 3. Create an incremental batch generator for ONLY those columns
     batch_stream = source_file.iter_batches(
-        batch_size=65536, 
+        batch_size=8192, 
         columns=selected_columns
     )
 
     # 4. Pull the schema of the first slice to initialize the writer
     first_batch = next(batch_stream)
-    writer = pq.ParquetWriter(output_dir, schema=first_batch.schema)
+    with pq.ParquetWriter(output_dir, first_batch.schema) as writer:
+        writer.write_batch(first_batch)
+        del first_batch
 
     # 5. Stream chunks from input disk to output disk sequentially
-    writer.write_batch(first_batch)
-    for batch in batch_stream:
-        writer.write_batch(batch)
+        for batch in batch_stream:
+            writer.write_batch(batch)
+            del batch
 
     # 6. Finalize and close the file
     writer.close()
+    gc.collect()
 def delete_file(fp):
     file_path = Path(fp)
 
@@ -44,86 +51,116 @@ def delete_file(fp):
     except Exception as e:
         print(f"An error occurred: {e}")
 def df_to_cells(boundries_df):
+    print("loading cells as objects ...")
     cells = []
-    last_cell_id = None
-    current_cell_id = None
-    current_cell = None
-    tmp_coords = []
+    if (Path(DATA_DIR) / 'tmp'/ 'cell_objects_loaded.pkl').is_file():
+        with open(Path(DATA_DIR) / 'tmp'/ 'cell_objects_loaded.pkl', "rb") as file:
+            cells = pickle.load(file)
+    else:
+        TOTAL_CELLS = boundries_df['cell_id'].nunique()
+        last_cell_id = None
+        tmp_coords = []
 
-    for row in boundries_df:
-        current_cell_id = boundries_df.iat[row,0]
-        if (current_cell_id != last_cell_id):
-            last_cell_id = current_cell_id
-            if current_cell != None:
-                current_cell.boundry = mpath.Path(tmp_coords)
-                tmp_coords.clear()
-                cells.append(current_cell)
+        for row in boundries_df.itertuples(index=False):
 
-            current_cell = cell(current_cell_id)
-        tmp_coords.append((boundries_df.iat[row,1],boundries_df.iat[row,2]))
-    
+            if row.cell_id != last_cell_id:
+        
+                if last_cell_id is not None:
+                    cells.append(cell(last_cell_id, tmp_coords))
+                    if len(cells) % 1000 == 0: 
+                        print(f"loaded {round((len(cells)/TOTAL_CELLS)*100,2)}% cell objects")
+                tmp_coords = []
+                last_cell_id = row.cell_id
+
+            tmp_coords.append((row.vertex_x, row.vertex_y))
+
+        # Don't forget the final cell
+        if last_cell_id is not None:
+            cells.append(cell(last_cell_id, tmp_coords))
+        with open(Path(DATA_DIR) / 'tmp'/ 'cell_objects_loaded.pkl', "wb") as file:
+            pickle.dump(cells, file)
+    print(f"Succesfully loaded {len(cells)} cells")
     return cells
+def build_spatial_index(cells):
+    print("Building spatial index ...")
+    polygons = [c.boundry for c in cells]
 
+    tree = STRtree(polygons)
+    polygon_lookup = {
+        id(poly): cell
+        for poly, cell in zip(polygons,cells)
+    }
 
+    return tree, polygon_lookup
+def find_cell(point, tree, polygon_lookup):
+
+    candidates = tree.query(point)
+
+    for poly in candidates:
+
+        if poly.contains(point):
+
+            return polygon_lookup[id(poly)].id
+
+    return None
 def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
-    import polars as pl
     import shutil
     import psutil
 
     #enviorment info
     PARENT_PATH = Path(transcripts_dir).parent
-    trns_seleced_path = PARENT_PATH + r"\tmp\transcripts_selected.parquet"
-    WORKING_SPACE = shutil.disk_usage(Path(transcripts_dir).root) #tupple: total,used,free
+    trns_seleced_path = PARENT_PATH / "tmp" / "transcripts_selected.parquet"
+    WORKING_SPACE = shutil.disk_usage(PARENT_PATH.root) #tupple: total,used,free
     WORKING_MEMORY = (psutil.virtual_memory().total, psutil.virtual_memory().available)
     
     #create tmp if it doesnt exist allready
-    if(Path(PARENT_PATH + r"\tmp").is_dir() == False):
-        (PARENT_PATH + r"\tmp").mkdir(parents=True, exist_ok = False)
-    
-    selected_to_tmp(transcripts_dir, trns_seleced_path, ['transcript_id', 'cell_id', 'x_location', 'y_location'])
-    
-    lazy_trns = pl.scan_parquet(trns_seleced_path)
-    sorted_lazy_trns = lazy_trns.sort("x_location")
-    sorted_lazy_trns.sink_parquet(Path(trns_seleced_path).parent + r"\sorted_selected_transcripts.parquet", statistics=True)
-    delete_file(trns_seleced_path)
-    trns_seleced_path = Path(trns_seleced_path).parent + r"\sorted_selected_transcripts.parquet"
+    if((PARENT_PATH / "tmp").is_dir() == False):
+        (PARENT_PATH / "tmp").mkdir(parents=True, exist_ok = False)
 
     #load constituant data into memory
     cell_boundries = pd.read_parquet(cellBoundres_dir) #about 15 mb ram
-    cell_boundries = df_to_cells(cell_boundries)
-    
+    cells = df_to_cells(cell_boundries)
+    tree, lookup = build_spatial_index(cells)
 
-    transcripts_rdr = pq.ParquetFile(trns_seleced_path)
-    trns_nrows = pq.read_metadata(trns_seleced_path).num_rows
-    trns_bsize = Path(trns_seleced_path).stat().st_size
+    transcripts = pq.ParquetFile(transcripts_dir)
+    trns_nrows = pq.read_metadata(transcripts_dir).num_rows
+    trns_bsize = Path(transcripts_dir).stat().st_size
 
+    bsize = min(((WORKING_MEMORY[1]*0.1)/trns_bsize), 1)*trns_nrows
+    time_tracker = time.perf_counter()
+    projected_time = time.perf_counter()
+    for batch in transcripts.iter_batches(batch_size=bsize,columns=['transcript_id', 'cell_id', 'x_location', 'y_location']):
 
-    for batch in transcripts_rdr.iter_batches(batch_size= min(((WORKING_MEMORY - 10**9)/trns_bsize), 1)*trns_nrows): #base batch size on available memory
-        # 'batch' is a pyarrow.RecordBatch object
-        print(f"Loaded batch with {len(batch)} rows.")
-        
-        # Optional: Convert the specific batch into a standard Pandas DataFrame
         df = batch.to_pandas()
 
-        for c in cell_boundries:
-            for row in batch:
-                is_inside = cell_boundries[c].boundry.contains_point((df.iat[row, 2],df.iat[row, 3])) #if it contains the point
-                if is_inside:
-                    df.iat[row,1] = c.id
+        for row in range(len(df)):
+
+            point = Point(
+                df.iat[row,2],
+                df.iat[row,3]
+            )
+            df.iat[row,1] = find_cell(
+                point,
+                tree,
+                lookup
+            )
+
+            if row % 20 == 0:
+                projected_time = ((time.perf_counter()- time_tracker)/20)*trns_nrows
+                print(f"process will complete in {round(projected_time/3600,0)} hours, {round(((projected_time/3600) % 1)*60,0)} min, and {round(((((projected_time/3600) % 1)*60) % 1)*60,0)} sec")
+                time_tracker = time.perf_counter()
         
         df.to_parquet(
-            Path(trns_seleced_path).parent + r"\trns_with_cellID.parquet", 
+            trns_seleced_path / "trns_with_cellID.parquet", 
             engine='fastparquet', 
             append=True
         )
 
-    delete_file(trns_seleced_path)
-    trns_seleced_path = Path(trns_seleced_path).parent + r"\trns_with_cellID.parquet"
+    trns_seleced_path = trns_seleced_path / "trns_with_cellID.parquet"
     print("cell attributation saved as:    " + trns_seleced_path)
     return trns_seleced_path
-    
 
-
+#def create_UMAP_profile(tc_association_dir, )
 
 def total_count_scatter():
 
@@ -150,3 +187,5 @@ def total_count_scatter():
 
 
     fig.show(config={'scrollZoom': True})
+
+assign_gene_to_cell(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\transcripts.parquet", r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\cell_boundaries.parquet")
