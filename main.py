@@ -10,9 +10,11 @@ import pickle
 import shapely
 import time
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import as_completed
 from cell import cell
+import duckdb
 
-DATA_DIR = Path(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
+DATA_DIR = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
 
 def selected_to_tmp(source_parquet, output_dir, selected_columns):
     import gc
@@ -117,6 +119,7 @@ def process_batch(df):
 
     df["cell_id"] = result
 
+
     return df
 
 def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
@@ -142,48 +145,152 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
     trns_nrows = pq.read_metadata(transcripts_dir).num_rows
     trns_bsize = Path(transcripts_dir).stat().st_size
 
+    print(pq.read_schema(transcripts_dir))
     bsize = 100000#min(((WORKING_MEMORY[1]*0.02*0.1)/trns_bsize), 1)*trns_nrows
     time_tracker = time.perf_counter()
     projected_time = time.perf_counter()
     rows_comp = 0
     
+    if (DATA_DIR / "tmp" / "trns_with_cellID.parquet").is_file() == False:
+        schema_dict = {
+        'transcript_id': pd.Series(dtype='uint64'),
+        'cell_id': pd.Series(dtype='str'),
+        'x_location': pd.Series(dtype='float'),
+        'y_location': pd.Series(dtype='float')
+        }
+
+        df= pd.DataFrame(schema_dict)
+        df.to_parquet(DATA_DIR / "tmp" / "trns_with_cellID.parquet", index=False)
+
+    MAX_IN_FLIGHT = 16  # About 2 × max_workers is a good starting point
+    tmp_file = DATA_DIR / "tmp" / "trns_with_cellID.incomplete.parquet"
+    final_file = DATA_DIR / "tmp" / "trns_with_cellID.parquet"
+
     with ProcessPoolExecutor(
         max_workers=8,
         initializer=init_worker,
-        initargs=([c.boundry for c in cells], [c.id for c in cells])
+        initargs=([c.boundry for c in cells], [c.id for c in cells]),
     ) as executor:
 
-        futures = []
-
-        for batch in transcripts.iter_batches(
+        batch_iter = transcripts.iter_batches(
             batch_size=bsize,
             columns=[
-                'transcript_id',
-                'cell_id',
-                'x_location',
-                'y_location'
-            ]
-        ):
+                "transcript_id",
+                "cell_id",
+                "x_location",
+                "y_location",
+            ],
+        )
+
+        futures = {}
+
+        # Fill the pipeline
+        for _ in range(MAX_IN_FLIGHT):
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                break
+
             df = batch.to_pandas()
-            futures.append(
-                executor.submit(process_batch, df)
-            )
+            future = executor.submit(process_batch, df)
+            futures[future] = None
 
-        for future in futures:
-            df = future.result()
-            rows_comp += len(df)
-            print(f"{round((rows_comp/trns_nrows),2)}% objects attributed")
-            df.to_parquet(
-                DATA_DIR / "tmp" / "trns_with_cellID.parquet",
-                engine="fastparquet",
-                append=True
-            )
+        try:
+                while futures:
 
-    trns_seleced_path = trns_seleced_path / "trns_with_cellID.parquet"
-    print(f"cell attributation saved as:   {trns_seleced_path}")
+                    # Wait for one completed batch
+                    future = next(as_completed(futures))
+                    futures.pop(future)
+
+                    df = future.result()
+
+                    rows_comp += len(df)
+
+                    print(
+                        f"{100 * rows_comp / trns_nrows:.2f}% complete "
+                        f"({rows_comp:,}/{trns_nrows:,})",
+                        flush=True
+                    )
+
+                    # Convert pandas dataframe to arrow table
+                    table = pa.Table.from_pandas(df)
+
+                    # Create parquet writer once
+                    if writer is None:
+                        writer = pq.ParquetWriter(
+                            tmp_file,
+                            table.schema
+                        )
+
+                    # Write this batch
+                    writer.write_table(table)
+
+
+                    # Submit one more batch
+                    try:
+                        batch = next(batch_iter)
+
+                        df = batch.to_pandas()
+
+                        future = executor.submit(
+                            process_batch,
+                            df
+                        )
+
+                        futures[future] = None
+
+                    except StopIteration:
+                        pass
+
+
+        finally:
+            # Ensure footer is written even if something fails
+            if writer is not None:
+                    writer.close()
+
+
+        # Only rename after successful completion
+        if tmp_file.exists():
+            tmp_file.replace(final_file)
+
+        print(f"Saved: {final_file}")
     return trns_seleced_path
 
-#def create_UMAP_profile(tc_association_dir, )
+def purge_rows(input_file, output_file = DATA_DIR / "tmp" / "transcripts_purged.parquet"):
+    target_column = '"status"'
+    value_to_remove = None # Use string or bytes depending on your data schema
+
+    # Establish a connection
+    conn = duckdb.connect()
+
+    # Stream out rows that DO NOT match your unwanted value
+    query = f"""
+        COPY (
+            SELECT * 
+            FROM read_parquet('{input_file}') 
+            WHERE {target_column} != '{value_to_remove}'
+        ) 
+        TO '{output_file}' (FORMAT 'PARQUET');
+    """
+
+    conn.execute(query)
+
+def create_UMAP_profile(tc_association_dir):
+    purge_rows(tc_association_dir, DATA_DIR / "tmp" / "transcripts_purged.parquet")
+    
+
+    import pyarrow.dataset as ds
+    
+    # 1. Point to the file (this only scans metadata, 0% data loaded to RAM)
+    dataset = ds.dataset(tc_association_dir, format="parquet")
+
+    # 2. Apply a filter and materialize only the matching rows
+    # Replace 'status' and 'active' with your column name and target value
+    matching_table = dataset.to_table(filter=ds.field("cell_id") == None)
+
+    # 3. Convert the filtered results to a Pandas DataFrame if needed
+    df = matching_table.to_pandas()
+
 
 def total_count_scatter():
 
@@ -210,6 +317,45 @@ def total_count_scatter():
 
 
     fig.show(config={'scrollZoom': True})
-
 if __name__ == "__main__":
-    assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
+    #assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
+    # path = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
+
+    
+    # pf = ParquetFile(path)
+
+    # print("Row groups:", len(pf.row_groups))
+
+    # for i, batch in enumerate(pf.iter_row_groups()):
+    #     print(i, batch.shape)
+
+    #     batch.to_parquet(
+    #         f"recovered_part_{i}.parquet",
+    #         engine="pyarrow"
+    #     )
+
+    # input_dir = Path(r"C:\Users\bend2\Documents\GitHub\SPSC-RNA-seq-manip\broken parquet")
+    # output_file = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\recovered.parquet")
+
+    # files = sorted(input_dir.glob("recovered_part_*.parquet"))
+
+    # writer = None
+
+    # for file in files:
+    #     print(f"Adding {file.name}")
+
+    #     table = pq.read_table(file)
+
+    #     if writer is None:
+    #         writer = pq.ParquetWriter(
+    #             output_file,
+    #             table.schema
+    #         )
+
+    #     writer.write_table(table)
+
+    # if writer:
+    #     writer.close()
+
+    # print("Finished")
+    purge_rows(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\recovered.parquet")
