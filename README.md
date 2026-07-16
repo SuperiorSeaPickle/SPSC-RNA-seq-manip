@@ -16,3 +16,8 @@ ATERA
 - Spatial signaling pathway mapping.
 - Download any kind of user manual, protocol, and any useful pdf information. Share it in a organized way (folders) to upload that to the CFCE Dropbox.
 - Do a presentation and/or word document  explaining things commented above.
+
+
+## NOTES
+- genes are not assigned to cell id by defalt. use cell boundries paquet to group genes by cell_id
+- chunking: sort by x value, copy until limit reached. sort by y value

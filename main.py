@@ -1,18 +1,18 @@
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import pyarrow.parquet as pq
+import pyarrow as pa
 from pathlib import Path
 from shapely.geometry import Polygon
-from shapely.geometry import Point
 from shapely.strtree import STRtree
 import pickle
+import shapely
 import time
+from concurrent.futures import ProcessPoolExecutor
+from cell import cell
 
-DATA_DIR = r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs"
-class cell:
-    def __init__(self, id, coords):
-        self.id = id
-        self.boundry = Polygon(coords)
+DATA_DIR = Path(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
 
 def selected_to_tmp(source_parquet, output_dir, selected_columns):
     import gc
@@ -84,7 +84,7 @@ def df_to_cells(boundries_df):
 def build_spatial_index(cells):
     print("Building spatial index ...")
     polygons = [c.boundry for c in cells]
-
+    
     tree = STRtree(polygons)
     polygon_lookup = {
         id(poly): cell
@@ -92,17 +92,33 @@ def build_spatial_index(cells):
     }
 
     return tree, polygon_lookup
-def find_cell(point, tree, polygon_lookup):
+def init_worker(polygons, ids):
+    global TREE, CELL_IDS
 
-    candidates = tree.query(point)
+    TREE = STRtree(polygons)
+    CELL_IDS = ids
+def process_batch(df):
+    global TREE, CELL_IDS
 
-    for poly in candidates:
+    points = shapely.points(
+        df["x_location"].to_numpy(),
+        df["y_location"].to_numpy()
+    )
 
-        if poly.contains(point):
+    point_ids, poly_ids = TREE.query(
+        points,
+        predicate="within"
+    )
 
-            return polygon_lookup[id(poly)].id
+    result = np.full(len(df), None, dtype=object)
 
-    return None
+    for p, poly in zip(point_ids, poly_ids):
+        result[p] = CELL_IDS[poly]
+
+    df["cell_id"] = result
+
+    return df
+
 def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
     import shutil
     import psutil
@@ -126,38 +142,45 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
     trns_nrows = pq.read_metadata(transcripts_dir).num_rows
     trns_bsize = Path(transcripts_dir).stat().st_size
 
-    bsize = min(((WORKING_MEMORY[1]*0.1)/trns_bsize), 1)*trns_nrows
+    bsize = 100000#min(((WORKING_MEMORY[1]*0.02*0.1)/trns_bsize), 1)*trns_nrows
     time_tracker = time.perf_counter()
     projected_time = time.perf_counter()
-    for batch in transcripts.iter_batches(batch_size=bsize,columns=['transcript_id', 'cell_id', 'x_location', 'y_location']):
+    rows_comp = 0
+    
+    with ProcessPoolExecutor(
+        max_workers=8,
+        initializer=init_worker,
+        initargs=([c.boundry for c in cells], [c.id for c in cells])
+    ) as executor:
 
-        df = batch.to_pandas()
+        futures = []
 
-        for row in range(len(df)):
-
-            point = Point(
-                df.iat[row,2],
-                df.iat[row,3]
+        for batch in transcripts.iter_batches(
+            batch_size=bsize,
+            columns=[
+                'transcript_id',
+                'cell_id',
+                'x_location',
+                'y_location'
+            ]
+        ):
+            df = batch.to_pandas()
+            futures.append(
+                executor.submit(process_batch, df)
             )
-            df.iat[row,1] = find_cell(
-                point,
-                tree,
-                lookup
-            )
 
-            if row % 20 == 0:
-                projected_time = ((time.perf_counter()- time_tracker)/20)*trns_nrows
-                print(f"process will complete in {round(projected_time/3600,0)} hours, {round(((projected_time/3600) % 1)*60,0)} min, and {round(((((projected_time/3600) % 1)*60) % 1)*60,0)} sec")
-                time_tracker = time.perf_counter()
-        
-        df.to_parquet(
-            trns_seleced_path / "trns_with_cellID.parquet", 
-            engine='fastparquet', 
-            append=True
-        )
+        for future in futures:
+            df = future.result()
+            rows_comp += len(df)
+            print(f"{round((rows_comp/trns_nrows),2)}% objects attributed")
+            df.to_parquet(
+                DATA_DIR / "tmp" / "trns_with_cellID.parquet",
+                engine="fastparquet",
+                append=True
+            )
 
     trns_seleced_path = trns_seleced_path / "trns_with_cellID.parquet"
-    print("cell attributation saved as:    " + trns_seleced_path)
+    print(f"cell attributation saved as:   {trns_seleced_path}")
     return trns_seleced_path
 
 #def create_UMAP_profile(tc_association_dir, )
@@ -188,4 +211,5 @@ def total_count_scatter():
 
     fig.show(config={'scrollZoom': True})
 
-assign_gene_to_cell(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\transcripts.parquet", r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\cell_boundaries.parquet")
+if __name__ == "__main__":
+    assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
