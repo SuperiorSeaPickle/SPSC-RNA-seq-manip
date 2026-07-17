@@ -13,34 +13,10 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
 from cell import cell
 import duckdb
+from collections import Counter
 
 DATA_DIR = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
 
-def selected_to_tmp(source_parquet, output_dir, selected_columns):
-    import gc
-    # 1. Open the source file metadata stream
-    source_file = pq.ParquetFile(source_parquet)
-
-    # 3. Create an incremental batch generator for ONLY those columns
-    batch_stream = source_file.iter_batches(
-        batch_size=8192, 
-        columns=selected_columns
-    )
-
-    # 4. Pull the schema of the first slice to initialize the writer
-    first_batch = next(batch_stream)
-    with pq.ParquetWriter(output_dir, first_batch.schema) as writer:
-        writer.write_batch(first_batch)
-        del first_batch
-
-    # 5. Stream chunks from input disk to output disk sequentially
-        for batch in batch_stream:
-            writer.write_batch(batch)
-            del batch
-
-    # 6. Finalize and close the file
-    writer.close()
-    gc.collect()
 def delete_file(fp):
     file_path = Path(fp)
 
@@ -102,27 +78,41 @@ def init_worker(polygons, ids):
 def process_batch(df):
     global TREE, CELL_IDS
 
+    # Make sure CELL_IDS supports numpy indexing
+    cell_ids = np.asarray(CELL_IDS)
+
+    # Create point geometries
     points = shapely.points(
         df["x_location"].to_numpy(),
         df["y_location"].to_numpy()
     )
 
+    # Query STRtree
     point_ids, poly_ids = TREE.query(
         points,
         predicate="within"
     )
 
-    result = np.full(len(df), None, dtype=object)
+    # No points matched any polygon
+    if len(point_ids) == 0:
+        return df.iloc[0:0].copy().assign(
+            cell_id=np.array([], dtype=np.int32)
+        )
 
-    for p, poly in zip(point_ids, poly_ids):
-        result[p] = CELL_IDS[poly]
+    # Assign cell IDs
+    cell_id = np.full(len(df), -1, dtype= object)
 
-    df["cell_id"] = result
+    cell_id[point_ids] = cell_ids[poly_ids]
 
+    # Remove unmatched points
+    keep = cell_id != -1
+
+    df = df.loc[keep].copy()
+    df["cell_id"] = cell_id[keep]
 
     return df
 
-def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
+def assign_gene_to_cell(transcripts_dir, cellBoundres_dir, keep_unasigned = False):
     import shutil
     import psutil
 
@@ -139,24 +129,22 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
     #load constituant data into memory
     cell_boundries = pd.read_parquet(cellBoundres_dir) #about 15 mb ram
     cells = df_to_cells(cell_boundries)
-    tree, lookup = build_spatial_index(cells)
 
     transcripts = pq.ParquetFile(transcripts_dir)
     trns_nrows = pq.read_metadata(transcripts_dir).num_rows
     trns_bsize = Path(transcripts_dir).stat().st_size
 
-    print(pq.read_schema(transcripts_dir))
     bsize = 100000#min(((WORKING_MEMORY[1]*0.02*0.1)/trns_bsize), 1)*trns_nrows
-    time_tracker = time.perf_counter()
-    projected_time = time.perf_counter()
     rows_comp = 0
     
     if (DATA_DIR / "tmp" / "trns_with_cellID.parquet").is_file() == False:
         schema_dict = {
         'transcript_id': pd.Series(dtype='uint64'),
+        'feature_name': pd.Series(dtype = 'str'),
         'cell_id': pd.Series(dtype='str'),
         'x_location': pd.Series(dtype='float'),
-        'y_location': pd.Series(dtype='float')
+        'y_location': pd.Series(dtype='float'),
+        'is_gene': pd.Series(dtype='bool')
         }
 
         df= pd.DataFrame(schema_dict)
@@ -165,7 +153,7 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
     MAX_IN_FLIGHT = 16  # About 2 × max_workers is a good starting point
     tmp_file = DATA_DIR / "tmp" / "trns_with_cellID.incomplete.parquet"
     final_file = DATA_DIR / "tmp" / "trns_with_cellID.parquet"
-
+    writer = None
     with ProcessPoolExecutor(
         max_workers=8,
         initializer=init_worker,
@@ -176,9 +164,11 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
             batch_size=bsize,
             columns=[
                 "transcript_id",
+                "feature_name",
                 "cell_id",
                 "x_location",
                 "y_location",
+                "is_gene"
             ],
         )
 
@@ -216,6 +206,7 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
                     table = pa.Table.from_pandas(df)
 
                     # Create parquet writer once
+
                     if writer is None:
                         writer = pq.ParquetWriter(
                             tmp_file,
@@ -256,40 +247,96 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir):
         print(f"Saved: {final_file}")
     return trns_seleced_path
 
-def purge_rows(input_file, output_file = DATA_DIR / "tmp" / "transcripts_purged.parquet"):
-    target_column = '"status"'
-    value_to_remove = None # Use string or bytes depending on your data schema
 
-    # Establish a connection
-    conn = duckdb.connect()
+def create_UMAP_profile(tc_associations):
+    if((DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet").is_file() == False):
+        con = duckdb.connect()
+        con.execute(f"""
+            COPY (
+                SELECT *
+                FROM '{tc_associations}'
+                ORDER BY cell_id
+            )
+            TO '{DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet"}'
+            (FORMAT PARQUET);
+        """) #takes 5-20 min
 
-    # Stream out rows that DO NOT match your unwanted value
-    query = f"""
-        COPY (
-            SELECT * 
-            FROM read_parquet('{input_file}') 
-            WHERE {target_column} != '{value_to_remove}'
-        ) 
-        TO '{output_file}' (FORMAT 'PARQUET');
-    """
+    selected_file = DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet"
 
-    conn.execute(query)
+    tc_parquet = pq.ParquetFile(selected_file)
+    num_row_groups = tc_parquet.num_row_groups
 
-def create_UMAP_profile(tc_association_dir):
-    purge_rows(tc_association_dir, DATA_DIR / "tmp" / "transcripts_purged.parquet")
-    
+    print(f"Total row groups to process: {num_row_groups}")
 
-    import pyarrow.dataset as ds
-    
-    # 1. Point to the file (this only scans metadata, 0% data loaded to RAM)
-    dataset = ds.dataset(tc_association_dir, format="parquet")
+    # Connect to an in-memory database and run a distinct query
+    unique_values = duckdb.query(f"""
+        SELECT DISTINCT feature_name 
+        FROM '{selected_file}'
+    """).df()
 
-    # 2. Apply a filter and materialize only the matching rows
-    # Replace 'status' and 'active' with your column name and target value
-    matching_table = dataset.to_table(filter=ds.field("cell_id") == None)
 
-    # 3. Convert the filtered results to a Pandas DataFrame if needed
-    df = matching_table.to_pandas()
+    features_uo = unique_values.sort_values('feature_name')
+
+    schema_dict = {
+        'feature_name': pd.Series(dtype='str'),
+        }
+
+    df= pd.DataFrame(schema_dict)
+    df.to_parquet(DATA_DIR / "tmp" / "cell_matrix.parquet", index=False)
+
+    # 2. Convert it into a DataFrame
+    df = pd.DataFrame(features_uo)
+
+    # 3. Write to a Parquet file
+    df.to_parquet(DATA_DIR / "tmp" / "cell_matrix.parquet", engine="pyarrow")
+    del df
+
+    current_cell_id = None
+
+    for row in stream_rows_from_parquet():
+
+        # Have we reached a new cell?
+        if row["cell_id"] != current_cell_id:
+
+            # Finish processing the previous cell
+            if current_cell_id is not None:
+                # Insert code here
+                pass
+
+            # Start the new cell
+            current_cell_id = row["cell_id"]
+
+            # Insert code here
+            pass
+
+        # Process a row belonging to the current cell
+        # Insert code here
+        pass
+
+    # Finish processing the last cell
+    if current_cell_id is not None:
+        # Insert code here
+        pass
+    for i in range(num_row_groups):
+        arrow_table = tc_parquet.read_row_group(i)
+        df_group = arrow_table.to_pandas()
+
+        for r in df_group:
+            gfeat.append(r['feature_name'])
+
+        frequencies = Counter((gfeat))
+        freq_org = {item: frequencies[item] for item in features_uo}
+        
+        
+        
+        
+        gfeat.clear()
+        
+
+        
+
+
+
 
 
 def total_count_scatter():
@@ -319,43 +366,4 @@ def total_count_scatter():
     fig.show(config={'scrollZoom': True})
 if __name__ == "__main__":
     #assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
-    # path = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
-
-    
-    # pf = ParquetFile(path)
-
-    # print("Row groups:", len(pf.row_groups))
-
-    # for i, batch in enumerate(pf.iter_row_groups()):
-    #     print(i, batch.shape)
-
-    #     batch.to_parquet(
-    #         f"recovered_part_{i}.parquet",
-    #         engine="pyarrow"
-    #     )
-
-    # input_dir = Path(r"C:\Users\bend2\Documents\GitHub\SPSC-RNA-seq-manip\broken parquet")
-    # output_file = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\recovered.parquet")
-
-    # files = sorted(input_dir.glob("recovered_part_*.parquet"))
-
-    # writer = None
-
-    # for file in files:
-    #     print(f"Adding {file.name}")
-
-    #     table = pq.read_table(file)
-
-    #     if writer is None:
-    #         writer = pq.ParquetWriter(
-    #             output_file,
-    #             table.schema
-    #         )
-
-    #     writer.write_table(table)
-
-    # if writer:
-    #     writer.close()
-
-    # print("Finished")
-    purge_rows(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\recovered.parquet")
+    create_UMAP_profile(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
