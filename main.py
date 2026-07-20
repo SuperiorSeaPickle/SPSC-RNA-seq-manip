@@ -8,14 +8,15 @@ from shapely.geometry import Polygon
 from shapely.strtree import STRtree
 import pickle
 import shapely
-import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
 from cell import cell
 import duckdb
 from collections import Counter
+import h5py
+from fastparquet import ParquetFile
 
-DATA_DIR = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
+DATA_DIR = Path(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
 
 def delete_file(fp):
     file_path = Path(fp)
@@ -233,12 +234,10 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir, keep_unasigned = Fals
                     except StopIteration:
                         pass
 
-
         finally:
             # Ensure footer is written even if something fails
             if writer is not None:
                     writer.close()
-
 
         # Only rename after successful completion
         if tmp_file.exists():
@@ -248,13 +247,16 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir, keep_unasigned = Fals
     return trns_seleced_path
 
 
-def create_UMAP_profile(tc_associations):
+def format_h5(tc_associations):
     if((DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet").is_file() == False):
         con = duckdb.connect()
+        con.execute("SET enable_progress_bar = true;")
+        con.execute("SET enable_progress_bar_print = true;")
         con.execute(f"""
             COPY (
                 SELECT *
                 FROM '{tc_associations}'
+                WHERE is_gene != false
                 ORDER BY cell_id
             )
             TO '{DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet"}'
@@ -262,76 +264,122 @@ def create_UMAP_profile(tc_associations):
         """) #takes 5-20 min
 
     selected_file = DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet"
-
+    
     tc_parquet = pq.ParquetFile(selected_file)
     num_row_groups = tc_parquet.num_row_groups
-
-    print(f"Total row groups to process: {num_row_groups}")
 
     # Connect to an in-memory database and run a distinct query
     unique_values = duckdb.query(f"""
         SELECT DISTINCT feature_name 
         FROM '{selected_file}'
-    """).df()
+    """).df() #sometimes takes 1 min
+    
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar = true;")
+    con.execute("SET enable_progress_bar_print = true;")
 
+    TOTAL_CELLS = pq.read_metadata(DATA_DIR / "cells.parquet").num_rows
 
     features_uo = unique_values.sort_values('feature_name')
+    print(type(features_uo))
+    selected_file = DATA_DIR / "tmp" / "cell_matrix.h5"
+    with h5py.File(selected_file, "w") as f:
 
-    schema_dict = {
-        'feature_name': pd.Series(dtype='str'),
-        }
+        f.create_dataset(
+            "counts",
+            shape=(len(features_uo), 0),
+            maxshape=(len(features_uo), None),      # unlimited columns
+            chunks=(10000, 100),
+            dtype=np.uint16
+        )
 
-    df= pd.DataFrame(schema_dict)
-    df.to_parquet(DATA_DIR / "tmp" / "cell_matrix.parquet", index=False)
+        dt = h5py.string_dtype("utf-8")
 
-    # 2. Convert it into a DataFrame
-    df = pd.DataFrame(features_uo)
+        f.create_dataset(
+            "column_names",
+            shape=(0,),
+            maxshape=(None,),
+            dtype=dt
+        )
 
-    # 3. Write to a Parquet file
-    df.to_parquet(DATA_DIR / "tmp" / "cell_matrix.parquet", engine="pyarrow")
-    del df
+        f.create_dataset(
+            "row_names",
+            shape=(len(features_uo),),
+            data = features_uo,
+            dtype=dt
+        )
 
-    current_cell_id = None
+    last_cell_id = None
+    feature_names = []
+    frequencies = None
+    freq_org = None
+    dfc = []
+    names_chunk = []
+    nCell_before_copy = 1000
+    feature_index = {
+        gene: i 
+        for i, gene in enumerate(features_uo["feature_name"])
+    }
+    with h5py.File(selected_file, "r+") as f:
+        for i in range(num_row_groups):
+            row_group = tc_parquet.read_row_group(i).to_pandas()
+            for row in row_group.itertuples(index = False):
+            
+                # Have we reached a new cell?
+                if row.cell_id != last_cell_id:
 
-    for row in stream_rows_from_parquet():
+                    # Finish processing the previous cell
+                    if last_cell_id is not None:
 
-        # Have we reached a new cell?
-        if row["cell_id"] != current_cell_id:
+                        frequencies = Counter(feature_names)
+                    
+                        freq_org = np.zeros(
+                            len(feature_index),
+                            dtype=np.uint16
+                        )
 
-            # Finish processing the previous cell
-            if current_cell_id is not None:
-                # Insert code here
-                pass
+                        for gene, count in frequencies.items():
+                            freq_org[feature_index[gene]] = count
+                        
+                        dfc.append(freq_org)
+                        names_chunk.append(row.cell_id)
 
-            # Start the new cell
-            current_cell_id = row["cell_id"]
+                        if len(names_chunk) % nCell_before_copy == 0:
+                            dfc_array = np.column_stack(dfc)
+                            data = f["counts"]
+                            names = f["column_names"]
+                            num_new_cols = len(names_chunk)
+                            
+                            current_cols = data.shape[1] # type: ignore
 
-            # Insert code here
-            pass
+                            # Safety checks
+                            assert dfc_array.shape[0] == data.shape[0], ( # type: ignore
+                                f"Row mismatch: HDF5 has {data.shape[0]} rows, " # type: ignore
+                                f"dfc has {dfc_array.shape[0]} rows"
+                            )
+                            assert dfc_array.shape[1] == num_new_cols, (
+                                f"Column mismatch: dfc has {dfc_array.shape[1]} columns, "
+                                f"names has {num_new_cols} names"
+                            )
+                            # Add one column
+                            
+                            data.resize((data.shape[0], current_cols + num_new_cols)) # type: ignore
 
-        # Process a row belonging to the current cell
-        # Insert code here
-        pass
+                            # Write the values
+                            data[:, current_cols:current_cols + num_new_cols] = dfc_array # type: ignore
+                            print(f"formated {round(100*((current_cols + num_new_cols)/TOTAL_CELLS),2)}% of {TOTAL_CELLS} cells into matrix")
+                            # Store the name
+                            names.resize((current_cols + num_new_cols,)) # type: ignore
+                            names[current_cols:current_cols + num_new_cols] = names_chunk # type: ignore
+                                
+                            dfc.clear()
+                            names_chunk.clear()
+                            
+                    # Start the new cell
+                    last_cell_id = row.cell_id
+                    feature_names.clear()
 
-    # Finish processing the last cell
-    if current_cell_id is not None:
-        # Insert code here
-        pass
-    for i in range(num_row_groups):
-        arrow_table = tc_parquet.read_row_group(i)
-        df_group = arrow_table.to_pandas()
-
-        for r in df_group:
-            gfeat.append(r['feature_name'])
-
-        frequencies = Counter((gfeat))
-        freq_org = {item: frequencies[item] for item in features_uo}
-        
-        
-        
-        
-        gfeat.clear()
-        
+                feature_names.append(row.feature_name)
 
         
 
@@ -366,4 +414,4 @@ def total_count_scatter():
     fig.show(config={'scrollZoom': True})
 if __name__ == "__main__":
     #assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
-    create_UMAP_profile(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
+    format_h5(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")

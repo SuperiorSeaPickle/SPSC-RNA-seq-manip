@@ -21,3 +21,33 @@ ATERA
 ## NOTES
 - genes are not assigned to cell id by defalt. use cell boundries paquet to group genes by cell_id
 - chunking: sort by x value, copy until limit reached. sort by y value
+- wtf is going on with the negative controll probes
+
+Raw transcripts.parquet
+          |
+          ↓
+Assign transcripts → cells
+          |
+          ↓
+Create cell × gene matrix
+          |
+          ↓
+AnnData
+          |
+          ↓
+Scanpy
+(cell clustering/type)
+          |
+          ↓
+Squidpy
+(spatial neighbors)
+          |
+          ↓
+LIANA
+(ligand/receptor inference)
+          |
+          ↓
+Network analysis
+          |
+          ↓
+Visualization
