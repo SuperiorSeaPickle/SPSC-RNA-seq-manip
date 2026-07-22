@@ -4,7 +4,6 @@ import plotly.express as px
 import pyarrow.parquet as pq
 import pyarrow as pa
 from pathlib import Path
-from shapely.geometry import Polygon
 from shapely.strtree import STRtree
 import pickle
 import shapely
@@ -14,9 +13,12 @@ from cell import cell
 import duckdb
 from collections import Counter
 import h5py
-from fastparquet import ParquetFile
+import scanpy as sc
+import anndata as ad
+from scipy.sparse import csc_matrix
+from sklearn.cluster import KMeans
 
-DATA_DIR = Path(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
+DATA_DIR = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
 
 def delete_file(fp):
     file_path = Path(fp)
@@ -121,7 +123,7 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir, keep_unasigned = Fals
     PARENT_PATH = Path(transcripts_dir).parent
     trns_seleced_path = PARENT_PATH / "tmp" / "transcripts_selected.parquet"
     WORKING_SPACE = shutil.disk_usage(PARENT_PATH.root) #tupple: total,used,free
-    WORKING_MEMORY = (psutil.virtual_memory().total, psutil.virtual_memory().available)
+    WORKING_MEMORY = (psutil.virtual_memory().total, psutil.virtual_memory().available) #implement later (was such low lever management required?)
     
     #create tmp if it doesnt exist allready
     if((PARENT_PATH / "tmp").is_dir() == False):
@@ -248,7 +250,7 @@ def assign_gene_to_cell(transcripts_dir, cellBoundres_dir, keep_unasigned = Fals
 
 
 def format_h5(tc_associations):
-    if((DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet").is_file() == False):
+    if not (DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet").is_file():
         con = duckdb.connect()
         con.execute("SET enable_progress_bar = true;")
         con.execute("SET enable_progress_bar_print = true;")
@@ -261,129 +263,306 @@ def format_h5(tc_associations):
             )
             TO '{DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet"}'
             (FORMAT PARQUET);
-        """) #takes 5-20 min
+        """)
 
     selected_file = DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet"
-    
+
     tc_parquet = pq.ParquetFile(selected_file)
     num_row_groups = tc_parquet.num_row_groups
 
-    # Connect to an in-memory database and run a distinct query
     unique_values = duckdb.query(f"""
-        SELECT DISTINCT feature_name 
+        SELECT DISTINCT feature_name
         FROM '{selected_file}'
-    """).df() #sometimes takes 1 min
-    
-    con = duckdb.connect()
-    con.execute("SET enable_progress_bar = true;")
-    con.execute("SET enable_progress_bar_print = true;")
+        ORDER BY feature_name
+    """).df()
+
+    feature_names = unique_values["feature_name"].tolist()
+
+    feature_index = {
+        gene: i
+        for i, gene in enumerate(feature_names)
+    }
 
     TOTAL_CELLS = pq.read_metadata(DATA_DIR / "cells.parquet").num_rows
 
-    features_uo = unique_values.sort_values('feature_name')
-    print(type(features_uo))
-    selected_file = DATA_DIR / "tmp" / "cell_matrix.h5"
-    with h5py.File(selected_file, "w") as f:
+    h5_file = DATA_DIR / "tmp" / "cell_matrix.h5"
 
-        f.create_dataset(
-            "counts",
-            shape=(len(features_uo), 0),
-            maxshape=(len(features_uo), None),      # unlimited columns
-            chunks=(10000, 100),
-            dtype=np.uint16
+
+    # Build CSC arrays
+
+
+    data = []
+    indices = []
+    indptr = [0]
+    column_names = []
+
+    last_cell = None
+    genes_in_cell = []
+
+    processed = 0
+
+    def finish_cell(cell_id):
+
+        nonlocal processed
+
+        counts = Counter(genes_in_cell)
+
+        # store only nonzero entries
+        for gene, count in sorted(
+            counts.items(),
+            key=lambda x: feature_index[x[0]]
+        ):
+            indices.append(feature_index[gene])
+            data.append(count)
+
+        indptr.append(len(data))
+        column_names.append(str(cell_id))
+
+        processed += 1
+
+        if processed % 1000 == 0:
+            print(
+                f"{processed:,}/{TOTAL_CELLS:,} cells "
+                f"({processed/TOTAL_CELLS:.1%})"
+            )
+
+
+    # Iterate through parquet
+
+
+    for rg in range(num_row_groups):
+
+        df = tc_parquet.read_row_group(rg).to_pandas()
+
+        for row in df.itertuples(index=False):
+
+            if last_cell is None:
+                last_cell = row.cell_id
+
+            if row.cell_id != last_cell:
+
+                finish_cell(last_cell)
+
+                genes_in_cell.clear()
+                last_cell = row.cell_id
+
+            genes_in_cell.append(row.feature_name)
+
+    # finish final cell
+
+    if last_cell is not None:
+        finish_cell(last_cell)
+
+    # Save CSC matrix
+
+    dt = h5py.string_dtype("utf-8")
+
+    with h5py.File(h5_file, "w") as f:
+
+        counts = f.create_group("counts")
+
+        counts.create_dataset(
+            "data",
+            data=np.asarray(data, dtype=np.uint16),
+            compression="gzip"
         )
 
-        dt = h5py.string_dtype("utf-8")
+        counts.create_dataset(
+            "indices",
+            data=np.asarray(indices, dtype=np.uint32),
+            compression="gzip"
+        )
 
-        f.create_dataset(
-            "column_names",
-            shape=(0,),
-            maxshape=(None,),
-            dtype=dt
+        counts.create_dataset(
+            "indptr",
+            data=np.asarray(indptr, dtype=np.uint64),
+            compression="gzip"
+        )
+
+        counts.create_dataset(
+            "shape",
+            data=np.array(
+                [len(feature_names), len(column_names)],
+                dtype=np.uint64
+            )
         )
 
         f.create_dataset(
             "row_names",
-            shape=(len(features_uo),),
-            data = features_uo,
+            data=np.asarray(feature_names, dtype=object),
             dtype=dt
         )
 
-    last_cell_id = None
-    feature_names = []
-    frequencies = None
-    freq_org = None
-    dfc = []
-    names_chunk = []
-    nCell_before_copy = 1000
-    feature_index = {
-        gene: i 
-        for i, gene in enumerate(features_uo["feature_name"])
-    }
-    with h5py.File(selected_file, "r+") as f:
-        for i in range(num_row_groups):
-            row_group = tc_parquet.read_row_group(i).to_pandas()
-            for row in row_group.itertuples(index = False):
-            
-                # Have we reached a new cell?
-                if row.cell_id != last_cell_id:
+        f.create_dataset(
+            "column_names",
+            data=np.asarray(column_names, dtype=object),
+            dtype=dt
+        )
 
-                    # Finish processing the previous cell
-                    if last_cell_id is not None:
+    print("Finished writing sparse CSC matrix.")
 
-                        frequencies = Counter(feature_names)
-                    
-                        freq_org = np.zeros(
-                            len(feature_index),
-                            dtype=np.uint16
-                        )
+def create_UMAP(cell_matrix_h5, from_file = False):
+    if not from_file:   
+        print("loading matrix...")
+        with h5py.File(cell_matrix_h5, 'r') as f:
+            counts = f['counts']
+            gene_names  = f['row_names'][:].astype(str)
+            cell_names  = f['column_names'][:].astype(str)
+            X = csc_matrix(
+            (
+                counts["data"][:],
+                counts["indices"][:],
+                counts["indptr"][:]
+            ),
+            shape=tuple(counts["shape"][:])
+            )
 
-                        for gene, count in frequencies.items():
-                            freq_org[feature_index[gene]] = count
-                        
-                        dfc.append(freq_org)
-                        names_chunk.append(row.cell_id)
+            adata = ad.AnnData(X.T)
+            adata.var_names = gene_names
+            adata.obs_names = cell_names
 
-                        if len(names_chunk) % nCell_before_copy == 0:
-                            dfc_array = np.column_stack(dfc)
-                            data = f["counts"]
-                            names = f["column_names"]
-                            num_new_cols = len(names_chunk)
-                            
-                            current_cols = data.shape[1] # type: ignore
+        # Keep genes expressed in at least 3 cells and cells with at least 200 genes
+        print("cleaning data...")
+        sc.pp.filter_cells(adata, min_genes=200)
+        sc.pp.filter_genes(adata, min_cells=3)
 
-                            # Safety checks
-                            assert dfc_array.shape[0] == data.shape[0], ( # type: ignore
-                                f"Row mismatch: HDF5 has {data.shape[0]} rows, " # type: ignore
-                                f"dfc has {dfc_array.shape[0]} rows"
-                            )
-                            assert dfc_array.shape[1] == num_new_cols, (
-                                f"Column mismatch: dfc has {dfc_array.shape[1]} columns, "
-                                f"names has {num_new_cols} names"
-                            )
-                            # Add one column
-                            
-                            data.resize((data.shape[0], current_cols + num_new_cols)) # type: ignore
+        print("normalizing data...")
+        sc.pp.normalize_total(adata, target_sum=1e4)
+        sc.pp.log1p(adata)
 
-                            # Write the values
-                            data[:, current_cols:current_cols + num_new_cols] = dfc_array # type: ignore
-                            print(f"formated {round(100*((current_cols + num_new_cols)/TOTAL_CELLS),2)}% of {TOTAL_CELLS} cells into matrix")
-                            # Store the name
-                            names.resize((current_cols + num_new_cols,)) # type: ignore
-                            names[current_cols:current_cols + num_new_cols] = names_chunk # type: ignore
-                                
-                            dfc.clear()
-                            names_chunk.clear()
-                            
-                    # Start the new cell
-                    last_cell_id = row.cell_id
-                    feature_names.clear()
+        print("finding highly variable genes...")
+        sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
+        adata = adata[:, adata.var.highly_variable].copy()
+        print("rescaling...")
+        sc.pp.scale(adata, max_value=10, zero_center= False)
+        print("running PCA...")
+        sc.tl.pca(adata,n_comps=50, random_state=0)
 
-                feature_names.append(row.feature_name)
-
+        print("generating UMAP...")
+        sc.pp.neighbors(adata,n_neighbors=15,n_pcs=50)
+        sc.tl.umap(adata)
         
+        print("creating KNN groups...")
+        sc.tl.leiden(adata, resolution=0.75, flavor="igraph", n_iterations=2)
+        print("saving progress...")
+        adata.write_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
+    else:
+        adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
+        sc.pl.umap(adata, color= "leiden")
 
+    while True:
+        print("type how many clusters you see:")
+        try:
+            nclust = int(input())
+            break
+        except:
+            print("invalid integer input")
 
+    kmeans = KMeans(n_clusters=nclust, random_state=0).fit(adata.obsm['X_pca'])
+    adata.obs['kmeans_5'] = kmeans.labels_.astype(str)
+    sc.pl.umap(adata,color='kmeans_5')
+
+def diff_analysis():
+    print("loading matrix...")
+    adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
+    print(adata)
+
+    sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon", key_added="rank_markers", )
+    sc.pl.rank_genes_groups_heatmap(adata,n_genes=3, key="rank_markers")
+    sc.pl.rank_genes_groups_stacked_violin(adata, n_genes=3, groupby='leiden')
+
+    print("saving progress...")
+    adata.write_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
+    
+    marker_df = pd.DataFrame(adata.uns["rank_markers"]["names"]).head(10)
+    print(marker_df)
+
+def annotate_cells(auto=False):
+    import decoupler as dc
+    
+
+    print("loading matrix...")
+    adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
+
+    diff_output = pd.DataFrame(adata.uns["rank_markers"]["names"]).head(10)
+    cell_annots = {}
+    if auto:
+        # markers = dc.op.resource("PanglaoDB", organism="human")
+        # markers = markers[
+        # markers["human"].astype(bool)
+        # & markers["canonical_marker"].astype(bool)
+        # & (markers["human_sensitivity"].astype(float) > 0.5)
+        # ]
+
+        # markers = markers.rename(
+        #     columns={
+        #         "cell_type": "source",
+        #         "genesymbol": "target"
+        #     }
+        # )[["source", "target"]]
+        # dc.mt.ora(
+        # data=adata,
+        # net=markers.drop_duplicates(subset=['source', 'target']),
+        # tmin=3,
+        # )
+
+        # # 1. Extract the scores from your AnnData object (replace 'ora_estimate' with your exact key)
+        acts = dc.pp.get_obsm(
+            adata,
+            key="score_ora"
+        )
+
+        # print("saving progress...")
+        # adata.write_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
+
+        # 2. Use Scanpy's built-in heatmap function
+        sc.pl.heatmap(
+            acts,
+            var_names=acts.var_names,
+            groupby="leiden",
+            cmap="viridis"
+        )
+
+        scores = pd.DataFrame(
+            acts.X,
+            columns=acts.var_names
+        )
+
+        scores["leiden"] = acts.obs["leiden"].values
+
+        cluster_scores = (
+            scores
+            .groupby("leiden")
+            .mean()
+        )
+
+        sc.pl.matrixplot(
+            acts,
+            var_names=acts.var_names,
+            groupby="leiden",
+            standard_scale="var",
+            cmap="viridis"
+        )
+
+        annotation = cluster_scores.idxmax(axis=1)
+
+        print(annotation)
+    else:
+        print("Manual Mode: Name the given cell based on its marker genes listed below. Press [enter] to move on to the next group")
+
+        for i in range(diff_output.shape[1]):
+            print(diff_output.iloc[:,i])
+            print("annotate cell as: ",end="")
+            cell_annots[i] = input()
+        
+        adata.obs['cell_type'] = adata.obs['leiden'].map(cell_annots).astype('category')
+        
+        print("saving progress...")
+        adata.write_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
+
+        print(adata)
+
+    
 
 
 
@@ -413,5 +592,8 @@ def total_count_scatter():
 
     fig.show(config={'scrollZoom': True})
 if __name__ == "__main__":
+
     #assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
-    format_h5(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
+    #format_h5(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
+    create_UMAP(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5")
+    diff_analysis()

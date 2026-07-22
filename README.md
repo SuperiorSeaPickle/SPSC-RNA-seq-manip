@@ -23,31 +23,29 @@ ATERA
 - chunking: sort by x value, copy until limit reached. sort by y value
 - wtf is going on with the negative controll probes
 
-Raw transcripts.parquet
+- Raw transcripts.parquet
           |
           ↓
-Assign transcripts → cells
+- Assign transcripts → cells
           |
           ↓
-Create cell × gene matrix
+- Create cell × gene matrix
           |
           ↓
-AnnData
+- AnnData
           |
           ↓
-Scanpy
+- Scanpy
 (cell clustering/type)
           |
           ↓
-Squidpy
-(spatial neighbors)
+- Squidpy (spatial neighbors)
           |
           ↓
-LIANA
-(ligand/receptor inference)
+- LIANA (ligand/receptor inference)
           |
           ↓
-Network analysis
+- Network analysis
           |
           ↓
-Visualization
+- Visualization
