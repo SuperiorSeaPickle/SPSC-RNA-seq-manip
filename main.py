@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import QApplication
 import sys
 import spatialdata as sd
 
-DATA_DIR = Path(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
+DATA_DIR = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
 
 
 def delete_file(fp):
@@ -606,7 +606,7 @@ def update_umap_batch(adata,fig,scatter, df, thresh):
     }
 
     # Add fixed unassigned color
-    color_map["U"] = "#000000"
+    color_map["U"] = "#000000" # type: ignore
 
     # Assign colors
     colors = np.array(
@@ -697,8 +697,8 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
                     "[help]": "print instructions and command list"
                 }
 
-    valid_genes = pd.unique((pd.DataFrame(adata.uns['rank_genes_groups']["names"]).head(50)).values.ravel()).tolist()
-    print(valid_genes)
+    valid_genes = adata.var_names_make_unique()
+    valid_genes = adata.var_names.tolist()
 
     com = None
     tmp_markers = []
@@ -919,7 +919,65 @@ def load_interactive():
     sdata = sd.read_zarr(str(DATA_DIR / "tmp" / "sdata.zarr"))
     viewer = Interactive(sdata)
     viewer.run()
-    
+
+
+def neighbor_analysis(adata):
+    import squidpy as sq
+
+    print(adata)
+
+    with open(DATA_DIR / "tmp" / "cell_objects_loaded.pkl", "rb") as f:
+        cells = pickle.load(f)
+
+    # Map cell ID -> centroid
+    centroid_lookup = {
+        str(cell.id): (
+            cell.boundry.centroid.x,
+            cell.boundry.centroid.y
+        )
+        for cell in cells
+    }
+
+    # Build centroid array in the same order as adata.obs_names
+    missing = []
+    centroids = []
+
+    for cell_id in adata.obs_names.astype(str):
+        if cell_id in centroid_lookup:
+            centroids.append(centroid_lookup[cell_id])
+        else:
+            missing.append(cell_id)
+
+    if missing:
+        print(f"Warning: {len(missing)} cells were not found in the pickle file.")
+
+    adata.obsm["spatial"] = np.asarray(centroids, dtype=float)
+    adata_tmp = ad.AnnData(
+        X=adata.layers["counts"],
+        obs=adata.obs.copy(),
+        var=adata.var.copy(),
+    )
+
+    adata.raw = adata_tmp
+
+
+    sq.gr.spatial_neighbors(adata)
+    sq.gr.nhood_enrichment(adata, cluster_key="leiden")
+    sq.gr.ligrec(adata, cluster_key="leiden", n_perms=1000, use_raw=True)
+
+    sc.pl.embedding(adata, basis="spatial", color="leiden")
+    sq.pl.ligrec(adata, n_perms=100, cluster_key="leiden")
+
+    print("saving progress...")
+    adata.write_h5ad(
+        str(DATA_DIR / "tmp" / "adata_tmp.h5ad"),
+        compression="lzf"
+    )
+
+    sq.pl.spatial_scatter(adata, color="leiden", library_id = None) # type: ignore
+    sq.pl.ligrec(adata, n_perms=100, cluster_key="leiden")
+                 
+
 def total_count_scatter():
 
     dirpath = r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\cells.parquet"
@@ -952,24 +1010,26 @@ if __name__ == "__main__":
     #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
     #diff_analysis(view_plots=True, save_plots=True)
     
-    #annotate_cells(mode="int",auto=False)
+    annotate_cells(mode="int",auto=False)
     
-    print("loading matrix...")
-    adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"), backed="r+")
+    # print("loading matrix...")
+    # adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
+    # print(adata)
+    # neighbor_analysis(adata)
     # Using rc_context to set black facecolors for axes and figure
-    with plt.rc_context(
-        {
-            "axes.facecolor": "black",
-            "figure.facecolor": "black",
-            "axes.labelcolor": "white",
-            "xtick.color": "white",
-            "ytick.color": "white",
-            "text.color": "white",
-            "axes.edgecolor": "white",
-        }
-    ):
-        sc.pl.umap(adata, color="majority_voting", frameon=True)
+    # with plt.rc_context(
+    #     {
+    #         "axes.facecolor": "black",
+    #         "figure.facecolor": "black",
+    #         "axes.labelcolor": "white",
+    #         "xtick.color": "white",
+    #         "ytick.color": "white",
+    #         "text.color": "white",
+    #         "axes.edgecolor": "white",
+    #     }
+    # ):
+    #     sc.pl.umap(adata, color="majority_voting", frameon=True)
 
-    create_spatial_zarr(DATA_DIR, adata)
+    # create_spatial_zarr(DATA_DIR, adata)
 
     #load_interactive()
