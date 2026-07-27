@@ -10,6 +10,7 @@ import shapely
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
 from cell import cell
+from DataFrameEditor import DataFrameEditor
 import duckdb
 from collections import Counter
 import h5py
@@ -19,16 +20,13 @@ from scipy.sparse import csc_matrix
 from sklearn.cluster import KMeans
 import seaborn as sns
 import matplotlib.pyplot as plt
+from typing import Literal
+from PyQt6.QtWidgets import QApplication
+import sys
 import spatialdata as sd
-import spatialdata_io as sd_io
-from spatialdata.transformations import Identity
-from spatialdata.models import PointsModel, Image2DModel,ShapesModel,TableModel
-import dask.dataframe as dd
-import dask.array as da
-import tifffile
-import geopandas as gpd
 
-DATA_DIR = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
+DATA_DIR = Path(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
+
 
 def delete_file(fp):
     file_path = Path(fp)
@@ -411,32 +409,33 @@ def format_h5(tc_associations):
 
     print("Finished writing sparse CSC matrix.")
 
-def create_UMAP(cell_matrix_h5, from_file = False, view_plots=True):
+
+def create_UMAP(cell_matrix_h5, from_file = False, view_plots=True, view_kmeans= False):
     if not from_file:   
         print("loading matrix...")
         with h5py.File(cell_matrix_h5, 'r') as f:
             counts = f['counts']
-            gene_names  = f['row_names'][:].astype(str)
-            cell_names  = f['column_names'][:].astype(str)
+            gene_names  = f['row_names'][:].astype(str) # type: ignore
+            cell_names  = f['column_names'][:].astype(str) # type: ignore
             X = csc_matrix(
             (
-                counts["data"][:],
-                counts["indices"][:],
-                counts["indptr"][:]
+                counts["data"][:], # type: ignore
+                counts["indices"][:], # type: ignore
+                counts["indptr"][:] # type: ignore
             ),
-            shape=tuple(counts["shape"][:])
+            shape=tuple(counts["shape"][:]) # type: ignore
             )
 
             adata = ad.AnnData(X.T)
-            adata.var_names = gene_names
-            adata.obs_names = cell_names
+            adata.var_names = gene_names # type: ignore
+            adata.obs_names = cell_names # type: ignore
 
         # Keep genes expressed in at least 3 cells and cells with at least 200 genes\
         print("cleaning data...")
         sc.pp.filter_cells(adata, min_genes=200)
         sc.pp.filter_genes(adata, min_cells=3)
 
-        adata.layers["counts"] = adata.X.copy()
+        adata.layers["counts"] = adata.X.copy() # type: ignore
 
         print("normalizing data...")
         sc.pp.normalize_total(adata, target_sum=1e4)
@@ -444,7 +443,7 @@ def create_UMAP(cell_matrix_h5, from_file = False, view_plots=True):
 
         print("finding highly variable genes...")
         sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
-        adata_hvg = adata[:, adata.var.highly_variable].copy()
+        adata_hvg = adata[:, adata.var.highly_variable].copy() # type: ignore
 
         print("rescaling...")
         sc.pp.scale(adata_hvg, max_value=10, zero_center= False)
@@ -467,7 +466,7 @@ def create_UMAP(cell_matrix_h5, from_file = False, view_plots=True):
         adata.obsp["distances"] = adata_hvg.obsp["distances"]
 
         # Metadata
-        adata.obs["leiden"] = adata_hvg.obs["leiden"]
+        adata.obs["leiden"] = adata_hvg.obs["leiden"] # type: ignore
 
         # Copy relevant unstructured data
         for key in ["pca", "neighbors", "umap", "leiden"]:
@@ -482,29 +481,30 @@ def create_UMAP(cell_matrix_h5, from_file = False, view_plots=True):
         adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"), backed="r+")
         if view_plots:
             sc.pl.umap(adata, color= "leiden")
+    if view_kmeans and view_plots:
+        while True:
+            print("type how many clusters you see:")
+            try:
+                nclust = int(input())
+                break
+            except:
+                print("invalid integer input")
 
-    while True:
-        print("type how many clusters you see:")
-        try:
-            nclust = int(input())
-            break
-        except:
-            print("invalid integer input")
-    if view_plots:
-        kmeans = KMeans(n_clusters=nclust, random_state=0).fit(adata.obsm['X_pca'])
+        kmeans = KMeans(n_clusters=nclust, random_state=0).fit(adata.obsm['X_pca']) # type: ignore
         adata.obs['kmeans_5'] = kmeans.labels_.astype(str)
         sc.pl.umap(adata,color='kmeans_5')
 
-def diff_analysis(view_plots = True):
+
+def diff_analysis(view_plots = True, save_plots=False):
     print("loading matrix...")
     adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
-    print("ranking gene groups...")
-    sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon",reference="rest", use_raw=False )
+    # print("ranking gene groups...")
+    # sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon",reference="rest", use_raw=False )
 
     if view_plots:
-        sc.pl.rank_genes_groups(adata, n_genes=20,sharey=False)
-        sc.pl.rank_genes_groups_heatmap(adata, n_genes=10, groupby="leiden", show_gene_labels=True,cmap="viridis")
-        sc.pl.rank_genes_groups_dotplot(adata, n_genes=5, standard_scale="var")
+        rgn = sc.pl.rank_genes_groups(adata, n_genes=20,sharey=False, save=save_plots)
+        rgd = sc.pl.rank_genes_groups_dotplot(adata, n_genes=5, standard_scale="var",save=save_plots)
+
 
     print("saving progress...")
     adata.write_h5ad(
@@ -514,6 +514,7 @@ def diff_analysis(view_plots = True):
     
     marker_df = pd.DataFrame(adata.uns['rank_genes_groups']['names']).head(20)
     print(marker_df)
+
 
 def validate_user_input(comm_dict, gene_dict):
     
@@ -530,14 +531,99 @@ def validate_user_input(comm_dict, gene_dict):
             else:
                 print("invalid command or gene. Type [help] to see a list of valid commands.")
     return user_input
+def compute_mask(adata, genes, threshold):
 
+    sc.tl.score_genes(adata, gene_list=genes, score_name='tmp_cell_score')
+    mask = adata.obs["tmp_cell_score"] > threshold
 
-def annotate_cells(auto=True, view_figures= True):
+    return mask
+def update_umap_indiv(adata,fig, scatter, markers, thresh, tmp_cpd, cname):
+    adata.obs["annotation"] = "U"
+
+    # Rebuild every annotation
+    for group_name, genes in markers.items():
+
+        if len(genes) == 0:
+            continue
+
+        mask = compute_mask(adata,genes,thresh)
+
+        adata.obs.loc[mask, "annotation"] = group_name # type: ignore
+
+    groups = adata.obs["annotation"]
+    colors = np.full(
+        adata.n_obs,
+        tmp_cpd["assigned"],
+        dtype=object
+    )
+
+    colors[groups == "U"] = tmp_cpd["unassinged"]
+
+    colors[groups == cname] = tmp_cpd["selected"]
+    scatter.set_facecolors(colors)   # type: ignore # categorical RGB colors
+    fig.canvas.draw_idle()
+    plt.pause(0.01)
+def update_umap_batch(adata,fig,scatter, df, thresh):
+    # Reset everyone
+    adata.obs["annotation"] = "U"
+
+    # Save the current group's marker list
+
+    markers = df.to_dict(orient='list')
+
+    # Rebuild every annotation
+    for group_name, genes in markers.items():
+
+        if len(genes) == 0:
+            continue
+
+        mask = compute_mask(
+            adata,
+            genes,
+            thresh
+        )
+
+        adata.obs.loc[mask, "annotation"] = group_name # type: ignore
+
+    groups = adata.obs["annotation"]
+    # Get only assigned groups
+    assigned_groups = [g for g in groups.unique() if g != "U"]
+
+    # Generate distinct colors for assigned groups
+    cmap1 = plt.get_cmap("tab20") # type: ignore
+    cmap2 = plt.get_cmap("tab20b")# type: ignore
+    cmap3 = plt.get_cmap("tab20c")# type: ignore
+
+    colors_list = (
+        [cmap1(i) for i in range(cmap1.N)] +
+        [cmap2(i) for i in range(cmap2.N)] +
+        [cmap3(i) for i in range(cmap3.N)]
+    )
+
+    color_map = {
+        group: colors_list[i]
+        for i, group in enumerate(assigned_groups)
+    }
+
+    # Add fixed unassigned color
+    color_map["U"] = "#000000"
+
+    # Assign colors
+    colors = np.array(
+        [color_map[group] for group in groups],
+        dtype=object
+    )
+
+    scatter.set_facecolors(colors)  # type: ignore
+    fig.canvas.draw_idle()
+    plt.pause(0.01)
+
+def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
     import celltypist
     
 
     print("loading matrix...")
-    adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"), backed="r+")
+    adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
     print(adata)
     diff_output = pd.DataFrame(adata.uns['rank_genes_groups']["names"]).head(10)
     cell_annots = {}
@@ -567,8 +653,8 @@ def annotate_cells(auto=True, view_figures= True):
             size=2
         )
         ct_table = pd.crosstab(
-            adata.obs['leiden'], 
-            adata.obs['majority_voting'],
+            adata.obs['leiden'],  # type: ignore
+            adata.obs['majority_voting'],# type: ignore
             normalize="index"
         )*100
 
@@ -588,140 +674,252 @@ def annotate_cells(auto=True, view_figures= True):
         plt.ylabel("Leiden Cluster")
         plt.tight_layout()
         plt.show()
-    else:
-        commands = {
-            "[ec]annotation_name": "ends the creation of current cluster mask",
-            "[end]" : "complete cluster annotation and close",
-            "[set_thresh]": "change the default threshold (between 0 and 10)",
-            "[rcc]": "restart current cluster",
-            "[RAC]": "restart all clusters",
-            "[help]": "print instructions and command list"
-        }
 
-        valid_genes = pd.unique((pd.DataFrame(adata.uns['rank_genes_groups']["names"]).head(50)).values.ravel()).tolist()
+    if mode == "cmd":
 
         print("Manual Mode: Use the figures that will be shown to create Expression filters.\n" \
-        "enter the genes by typing the name, then pressing enter to add another gene. type [ec] to finish the filter. for example:\n" \
-        "KIT \n" \
-        "CTSG \n" \
-        "MS4A2\n" \
-        "CPA3\n" \
-        "IL1RL1\n" \
-        "[ec]cell type 1\n" \
-        "an updating viewer will show you what's been selected\n" \
-        "Press [Enter] to continue...")
+                "enter the genes by typing the name, then pressing enter to add another gene. type [ec] to finish the filter. for example:\n" \
+                "KIT \n" \
+                "CTSG \n" \
+                "MS4A2\n" \
+                "CPA3\n" \
+                "IL1RL1\n" \
+                "[ec]cell type 1\n" \
+                "an updating viewer will show you what's been selected\n" \
+                "Press [Enter] to continue...")
 
-        com = None
-        tmp_markers = []
-        markers = pd.DataFrame()
-        thresh = 2.0
-        cname = None
+    commands = {
+                    "[ec]annotation_name": "ends the creation of current cluster mask",
+                    "[end]" : "complete cluster annotation and close",
+                    "[set_thresh]": "change the default threshold (between 0 and 10)",
+                    "[rcc]": "restart current cluster",
+                    "[RAC]": "restart all clusters",
+                    "[help]": "print instructions and command list"
+                }
 
-        coords = adata.obsm["X_umap"]
-        adata.obs["annotation"] = "U"
-        fig, ax = plt.subplots()
-        scatter = ax.scatter(
-            coords[:, 0],
-            coords[:, 1],
-            c=tmp_cpd["unassinged"],
-            s=0.5
-        )
-        plt.show(block=False)
+    valid_genes = pd.unique((pd.DataFrame(adata.uns['rank_genes_groups']["names"]).head(50)).values.ravel()).tolist()
+    print(valid_genes)
 
+    com = None
+    tmp_markers = []
+    markers = {}
+    thresh = 0.8
+    cname = "tmp"
+    needs_update = False
+
+    coords = adata.obsm["X_umap"]
+    adata.obs["annotation"] = "U"
+    fig, ax = plt.subplots()
+    scatter = ax.scatter(
+        coords[:, 0],
+        coords[:, 1],
+        c=tmp_cpd["unassinged"],
+        s=0.5
+    )
+    plt.show(block=False)
+
+
+    if mode == "cmd":
         while True:
             com = validate_user_input(commands, valid_genes)
+            
             if com.startswith("[ec]"):
                 cname = com[4:]
-                markers[cname] = tmp_markers
+                markers[cname] = markers.pop("tmp")
                 tmp_markers.clear()
+                needs_update = True
 
 
             elif com == "[end]":
                 break
+            
             elif com == "[set_thresh]":
+                needs_update = False
                 while True:
                     try:
                         thresh = float(input())
                         if not (0 <= thresh <= 10):
-                            raise ValueError(f"threshold must be between 0 and 1. Got: {thresh}")
-                    except:
-                        print("invalid input: must be float in interval [0,10]")
+                            raise ValueError
+                        break
+                    except ValueError:
+                        print("Threshold must be between 0 and 10.")
+
             elif com == "[rcc]":
+                needs_update = False
                 tmp_markers.clear()
+            
             elif com == "[RAC]":
-                markers = pd.DataFrame()
+                needs_update = False
+                markers = {}
             else:
+                needs_update = True
                 tmp_markers.append(com)
 
-            expr = adata[:, tmp_markers].X
-            mask = np.ones(adata.n_obs, dtype=bool)
-            for i in range(len(tmp_markers)):
-                gene_expr = expr[:, i]
+            if not needs_update:
+                continue
 
-                if hasattr(gene_expr, "toarray"):
-                    gene_expr = gene_expr.toarray().ravel()
-
-                mask &= gene_expr > thresh
-            adata.obs.loc[mask, "annotation"] = cname
-            groups = adata.obs["annotation"]
-            colors = np.full(
-                adata.n_obs,
-                tmp_cpd["assigned"],
-                dtype=object
+            markers[cname] = tmp_markers.copy()
+            update_umap_indiv(
+                adata,
+                fig,
+                scatter,
+                markers,
+                thresh,
+                tmp_cpd,
+                cname
             )
-            colors[groups == "U"] = tmp_cpd["unassinged"]
-            colors[groups == cname] = tmp_cpd["selected"]
-            scatter.set_facecolors(colors)   # categorical RGB colors
-            fig.canvas.draw_idle()
-            plt.pause(0.01)
+    elif mode == "int":
+        app = QApplication.instance() or QApplication(sys.argv)
+
+        # 2. Initialize the DataFrame with empty (None/NaN) values
+        df = diff_output
+        editor = DataFrameEditor(df, valid_genes)
+        editor.show()
+        while True:
+            print("Press [Try Assosiation] to continue")
+            new_df = editor.wait_for_user()
+
+
+            if editor.finished:
+                print("Exiting annotation")
+
+                break
+
+            if new_df is not None:
+
+                print("Received new dataframe")
+
+                # run your analysis here
+                print("Trying Assosiation. Click [ok] to accept")
+                df = editor.get_dataframe()
+                update_umap_batch(
+                    adata,
+                    fig,
+                    scatter,
+                    df,
+                    thresh
+                )
+
+                editor.result_df = None
+        print("Annotation Complete")
+
+def create_spatial_zarr(DATA_DIR, adata: ad.AnnData):
+    from napari_spatialdata import Interactive
+    from spatialdata.models import (
+        Image2DModel,
+        ShapesModel,
+        TableModel
+    )
+    import spatialdata.models
+    from spatialdata.transformations import Identity,Scale
+    import spatialdata_io as sdio
+    import dask.array as da
+    import tifffile
+    import geopandas as gpd
+    import zarr
+    import inspect
+
+    print(sd.__version__)
+    print(sdio.__version__)
+    print(inspect.signature(Image2DModel.parse))
+    print([x for x in dir(spatialdata.models) if "Image" in x or "Scale" in x])
+
+    # -------------------------
+    # Image (lazy)
+    # -------------------------
         
+    tif = tifffile.TiffFile(DATA_DIR / "morphology.ome.tif")
+    root = zarr.open(tif.series[0].aszarr(), mode="r")
 
+    pixel_size = 0.2125
+    # highest resolution
+    image = da.from_zarr(root["0"]) # type: ignore
+    print(image.chunksize)  # sanity check
+    image = image.rechunk((1, 1024, 1024))
 
-
-def view_spatial(adata):
-
-    # ddf = dd.read_parquet(str(DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet"),
-    # columns=[
-    #     "x_location",
-    #     "y_location",
-    #     "feature_name",
-    # ])
-    # points_element = PointsModel.parse(
-    #     ddf,
-    #     coordinates={'x': "x_location", 'y': "y_location"},
-    #     feature_key= "feature_name"
-    # )
-
-    ome_dask = da.from_zarr(tifffile.imread(str(DATA_DIR/"morphology.ome", aszarr=True)))
     image_element = Image2DModel.parse(
-        data=ome_dask,
-        dims=('c','y','x'),
-        chunks=(1,1024,1024),
-        transformations={"global": Identity()}
+        image,
+        dims=("c", "y", "x"),
+        transformations={"global": Scale([pixel_size, pixel_size], axes=("x", "y"))},
+        scale_factors=[2, 2, 2, 2, 2, 2, 2],
+        chunks=(1, 1024, 1024),
     )
 
-    gdf = gpd.read_parquet(str(DATA_DIR/"cell_boundaries.parquet"))
-    shape_trnsfr = {"global": Identity()}
-    shapes_element = ShapesModel.parse(gdf, transformations=shape_trnsfr)
 
-    adata.obs["region"] = "cell_boundries"
-    adata.obs["instance_id"] = adata.obs_names.astype(int)
+    # -------------------------
+    # Cell boundaries
+    # -------------------------
+
+    with open(DATA_DIR / "tmp" / "cell_objects_loaded.pkl", "rb") as f:
+        cells = pickle.load(f)
+
+    gdf = gpd.GeoDataFrame(
+        {"cell_id": [c.id for c in cells], "geometry": [c.boundry for c in cells]},
+        geometry="geometry",
+    )# type: ignore
+    gdf["geometry"] = gdf["geometry"].simplify(tolerance=0.5) # type: ignore
+    gdf.index = np.arange(len(gdf))
+    gdf.index.name = None
+
+    shapes_element = ShapesModel.parse(gdf, transformations={"global": Identity()})
+
+    # table: map adata rows onto the SAME integers, via matching barcode strings
+    id_to_int = {cid: i for i, cid in enumerate(gdf["cell_id"])} # type: ignore
+
+    # 1. Drop heavy pairwise graphs and embeddings
+    adata.obsp.clear()
+    adata.obsm.clear()
+
+    # 2. Clear unneeded analysis metadata from uns (keep spatialdata_attrs!)
+    keys_to_remove = ['neighbors', 'pca', 'umap', 'rank_genes_groups', 'dendrogram_leiden', 'hvg', 'log1p']
+    for key in keys_to_remove:
+        adata.uns.pop(key, None)
+        
+    adata.obs["instance_id"] = adata.obs_names.map(id_to_int)
+
+    n_before = adata.n_obs
+    adata = adata[adata.obs["instance_id"].notna()].copy()
+    print(f"dropped {n_before - adata.n_obs} cells with no matching shape")
+    adata.obs["instance_id"] = adata.obs["instance_id"].astype(int) # type: ignore
+    adata.obs["region"] = "cell_boundaries"
+
     table_element = TableModel.parse(
-        adata,
-        region="cell_boundries",
-        region_key="region",
-        instance_key="instance_id"
+        adata, region="cell_boundaries", region_key="region", instance_key="instance_id",
     )
+
+
+    # -------------------------
+    # SpatialData object
+    # -------------------------
+
     sdata = sd.SpatialData(
-    images={"tissue_image": image_element},
-    #points={"transcripts": points_element},
-    shapes={"cell_boundaries": shapes_element},
-    tables={"expression_table": table_element}
-)
-    interactive = interactive(sdata)
-    interactive.run()
+        images={
+            "tissue_image": image_element
+        },
+        shapes={
+            "cell_boundaries": shapes_element
+        },
+        tables={
+            "expression_table": table_element
+        }
+    )
+    shapes_idx = sdata.shapes["cell_boundaries"].index
+    table_ids = sdata.tables["expression_table"].obs["instance_id"]
 
+    print("shapes index:", shapes_idx.dtype, shapes_idx[:5].tolist())
+    print("table instance_id:", table_ids.dtype, table_ids.values[:5])
+    print("overlap:", len(set(shapes_idx) & set(table_ids)), "/", len(table_ids))
+    viewer = Interactive(sdata)
+    viewer.run()
+    #sdata.write(str(DATA_DIR / "tmp" / "sdata.zarr"), overwrite=True)
 
+def load_interactive():
+    from napari_spatialdata import Interactive
+
+    sdata = sd.read_zarr(str(DATA_DIR / "tmp" / "sdata.zarr"))
+    viewer = Interactive(sdata)
+    viewer.run()
+    
 def total_count_scatter():
 
     dirpath = r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\cells.parquet"
@@ -751,9 +949,27 @@ if __name__ == "__main__":
 
     #assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
     #format_h5(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
-    #create_UMAP(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
-    #diff_analysis(view_plots=False)
-    #annotate_cells(auto=False)
+    #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
+    #diff_analysis(view_plots=True, save_plots=True)
+    
+    #annotate_cells(mode="int",auto=False)
+    
     print("loading matrix...")
     adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"), backed="r+")
-    view_spatial(adata)
+    # Using rc_context to set black facecolors for axes and figure
+    with plt.rc_context(
+        {
+            "axes.facecolor": "black",
+            "figure.facecolor": "black",
+            "axes.labelcolor": "white",
+            "xtick.color": "white",
+            "ytick.color": "white",
+            "text.color": "white",
+            "axes.edgecolor": "white",
+        }
+    ):
+        sc.pl.umap(adata, color="majority_voting", frameon=True)
+
+    create_spatial_zarr(DATA_DIR, adata)
+
+    #load_interactive()
