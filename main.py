@@ -11,6 +11,7 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
 from cell import cell
 from DataFrameEditor import DataFrameEditor
+from plot_window import ScatterPlotWindow
 import duckdb
 from collections import Counter
 import h5py
@@ -20,12 +21,20 @@ from scipy.sparse import csc_matrix
 from sklearn.cluster import KMeans
 import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib
+import matplotlib.colors as mcolors
 from typing import Literal
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QEventLoop
 import sys
 import spatialdata as sd
+import plotly.graph_objects as go
 
-DATA_DIR = Path(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs")
+matplotlib.use("qtagg")
+App = QApplication.instance() or QApplication(sys.argv)
+editor = None
+
+DATA_DIR = Path(r"C:\Users\bend2\Documents\PROJECTS\aterads test")
 
 
 def delete_file(fp):
@@ -531,96 +540,95 @@ def validate_user_input(comm_dict, gene_dict):
             else:
                 print("invalid command or gene. Type [help] to see a list of valid commands.")
     return user_input
-def compute_mask(adata, genes, threshold):
-
-    sc.tl.score_genes(adata, gene_list=genes, score_name='tmp_cell_score')
+def compute_mask(adata, genes, threshold, is_new=True):
+    if is_new:
+        genes = genes[genes != ""]
+        sc.tl.score_genes(adata, gene_list=genes, score_name='tmp_cell_score')
     mask = adata.obs["tmp_cell_score"] > threshold
 
     return mask
-def update_umap_indiv(adata,fig, scatter, markers, thresh, tmp_cpd, cname):
-    adata.obs["annotation"] = "U"
+def compute_score(adata, genes):
+    sc.tl.score_genes(adata, gene_list=genes, score_name='tmp_cell_score')
+    return adata.obs["tmp_cell_score"].to_numpy().copy()  # copy! column gets overwritten next call
+def _recolor(info):
+    info[0].obs["annotation"] = pd.Categorical(info[0].obs["annotation"])
+    groups = info[0].obs["annotation"]
+    assigned_groups = [g for g in groups.cat.categories if g != "Unassigned"]
 
-    # Rebuild every annotation
-    for group_name, genes in markers.items():
-
-        if len(genes) == 0:
-            continue
-
-        mask = compute_mask(adata,genes,thresh)
-
-        adata.obs.loc[mask, "annotation"] = group_name # type: ignore
-
-    groups = adata.obs["annotation"]
-    colors = np.full(
-        adata.n_obs,
-        tmp_cpd["assigned"],
-        dtype=object
-    )
-
-    colors[groups == "U"] = tmp_cpd["unassinged"]
-
-    colors[groups == cname] = tmp_cpd["selected"]
-    scatter.set_facecolors(colors)   # type: ignore # categorical RGB colors
-    fig.canvas.draw_idle()
-    plt.pause(0.01)
-def update_umap_batch(adata,fig,scatter, df, thresh):
-    # Reset everyone
-    adata.obs["annotation"] = "U"
-
-    # Save the current group's marker list
-
-    markers = df.to_dict(orient='list')
-
-    # Rebuild every annotation
-    for group_name, genes in markers.items():
-
-        if len(genes) == 0:
-            continue
-
-        mask = compute_mask(
-            adata,
-            genes,
-            thresh
-        )
-
-        adata.obs.loc[mask, "annotation"] = group_name # type: ignore
-
-    groups = adata.obs["annotation"]
-    # Get only assigned groups
-    assigned_groups = [g for g in groups.unique() if g != "U"]
-
-    # Generate distinct colors for assigned groups
-    cmap1 = plt.get_cmap("tab20") # type: ignore
-    cmap2 = plt.get_cmap("tab20b")# type: ignore
-    cmap3 = plt.get_cmap("tab20c")# type: ignore
-
+    cmap1 = plt.get_cmap("tab20")
+    cmap2 = plt.get_cmap("tab20b")
+    cmap3 = plt.get_cmap("tab20c")
     colors_list = (
         [cmap1(i) for i in range(cmap1.N)] +
         [cmap2(i) for i in range(cmap2.N)] +
         [cmap3(i) for i in range(cmap3.N)]
     )
+    color_map = {g: colors_list[i] for i, g in enumerate(assigned_groups)}
+    color_map["Unassigned"] = (0.0, 0.0, 0.0, 1.0)
 
-    color_map = {
-        group: colors_list[i]
-        for i, group in enumerate(assigned_groups)
-    }
+    info[0].uns["annotation_colors"] = [
+        mcolors.to_hex(color_map[c]) for c in groups.cat.categories
+    ]
 
-    # Add fixed unassigned color
-    color_map["U"] = "#000000" # type: ignore
+    codes, uniques = pd.factorize(groups)
+    lut = np.array([color_map[u] for u in uniques])
+    colors = lut[codes]
 
-    # Assign colors
-    colors = np.array(
-        [color_map[group] for group in groups],
-        dtype=object
+    info[2].set_facecolors(colors)
+    info[1].update_legend(color_map)   # <-- new
+    info[1].canvas.draw_idle()
+def update_figs(info, app, thresh, recomp=True):
+    current_df = app.get_dataframe()
+    is_valid = current_df.isin(app.valid_genes).all().all()
+
+    if not is_valid:
+        print("Invalid association")
+        return
+
+    app.result_df = current_df
+    markers = current_df.to_dict(orient='list')
+
+    if not hasattr(app, "_score_cache"):
+        app._score_cache = {}
+
+    # Force plain object dtype so arbitrary group_name strings can always be assigned
+    info[0].obs["annotation"] = pd.Series(
+        ["Unassigned"] * info[0].n_obs, index=info[0].obs.index, dtype=object
     )
 
-    scatter.set_facecolors(colors)  # type: ignore
-    fig.canvas.draw_idle()
-    plt.pause(0.01)
+    for group_name, genes in markers.items():
+        if len(genes) == 0:
+            continue
 
+        gene_key = frozenset(genes)
+        cached = app._score_cache.get(group_name)
+
+        if cached is None:
+            score = compute_score(info[0], genes)
+            app._score_cache[group_name] = (gene_key, score)
+        elif recomp and cached[0] != gene_key:
+            score = compute_score(info[0], genes)
+            app._score_cache[group_name] = (gene_key, score)
+        else:
+            score = cached[1]
+
+        mask = score > thresh[group_name]
+        info[0].obs.loc[mask, "annotation"] = group_name  # object dtype -> no category restriction
+
+    _recolor(info)
+    
+def annotation_complete():
+
+    global editor
+
+    assert editor is not None
+    df = editor.get_dataframe()
+
+    print("Annotation Complete")
+    
 def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
     import celltypist
-    
+    global editor, plot_window
 
     print("loading matrix...")
     adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
@@ -699,6 +707,7 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
 
     valid_genes = adata.var_names_make_unique()
     valid_genes = adata.var_names.tolist()
+    valid_genes.append("")
 
     com = None
     tmp_markers = []
@@ -708,100 +717,45 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
     needs_update = False
 
     coords = adata.obsm["X_umap"]
-    adata.obs["annotation"] = "U"
-    fig, ax = plt.subplots()
-    scatter = ax.scatter(
-        coords[:, 0],
-        coords[:, 1],
-        c=tmp_cpd["unassinged"],
-        s=0.5
+    adata.obs["annotation"] = "Unassigned"
+    plot_window = ScatterPlotWindow(
+        coords,
+        tmp_cpd["unassinged"]
     )
-    plt.show(block=False)
 
+    plot_window.show()
 
-    if mode == "cmd":
-        while True:
-            com = validate_user_input(commands, valid_genes)
-            
-            if com.startswith("[ec]"):
-                cname = com[4:]
-                markers[cname] = markers.pop("tmp")
-                tmp_markers.clear()
-                needs_update = True
-
-
-            elif com == "[end]":
-                break
-            
-            elif com == "[set_thresh]":
-                needs_update = False
-                while True:
-                    try:
-                        thresh = float(input())
-                        if not (0 <= thresh <= 10):
-                            raise ValueError
-                        break
-                    except ValueError:
-                        print("Threshold must be between 0 and 10.")
-
-            elif com == "[rcc]":
-                needs_update = False
-                tmp_markers.clear()
-            
-            elif com == "[RAC]":
-                needs_update = False
-                markers = {}
-            else:
-                needs_update = True
-                tmp_markers.append(com)
-
-            if not needs_update:
-                continue
-
-            markers[cname] = tmp_markers.copy()
-            update_umap_indiv(
-                adata,
-                fig,
-                scatter,
-                markers,
-                thresh,
-                tmp_cpd,
-                cname
-            )
-    elif mode == "int":
-        app = QApplication.instance() or QApplication(sys.argv)
+    ext_info = (
+        adata,
+        plot_window,
+        plot_window.scatter
+    )
+    if mode == "int":
 
         # 2. Initialize the DataFrame with empty (None/NaN) values
-        df = diff_output
-        editor = DataFrameEditor(df, valid_genes)
-        editor.show()
-        while True:
-            print("Press [Try Assosiation] to continue")
-            new_df = editor.wait_for_user()
+        editor = DataFrameEditor(
+            diff_output,
+            valid_genes,
+            ext_info,
+            thresh
+        )
 
+        editor.updateFigs.connect(update_figs)
+        editor.accepted.connect(annotation_complete)
 
-            if editor.finished:
-                print("Exiting annotation")
+        editor.show()  # non-modal, no input restrictions on other windows
 
-                break
+        loop = QEventLoop()
+        editor.finished.connect(loop.quit)
+        loop.exec()    # blocks annotate_cells here until editor closes
 
-            if new_df is not None:
-
-                print("Received new dataframe")
-
-                # run your analysis here
-                print("Trying Assosiation. Click [ok] to accept")
-                df = editor.get_dataframe()
-                update_umap_batch(
-                    adata,
-                    fig,
-                    scatter,
-                    df,
-                    thresh
-                )
-
-                editor.result_df = None
-        print("Annotation Complete")
+        if editor.result_df is not None:
+            adata.uns["marker_genes"] = editor.result_df.to_dict(orient="list")
+        print("saving annotations...")
+        ext_info[0].write_h5ad(
+            str(DATA_DIR / "tmp" / "adata_tmp.h5ad"),
+            compression="lzf"
+        )
 
 def create_spatial_zarr(DATA_DIR, adata: ad.AnnData):
     from napari_spatialdata import Interactive
@@ -1004,14 +958,13 @@ def total_count_scatter():
 
     fig.show(config={'scrollZoom': True})
 if __name__ == "__main__":
-
+    import napari
     #assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
     #format_h5(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
     #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
     #diff_analysis(view_plots=True, save_plots=True)
     
     annotate_cells(mode="int",auto=False)
-    
     # print("loading matrix...")
     # adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
     # print(adata)

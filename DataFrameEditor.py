@@ -3,6 +3,8 @@ import pandas as pd
 
 from PyQt6.QtWidgets import (
     QApplication,
+    QSlider,
+    QLabel,
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
@@ -13,37 +15,62 @@ from PyQt6.QtWidgets import (
 )
 
 from PyQt6.QtGui import QColor
-from PyQt6.QtCore import QEventLoop,QSignalBlocker
+from PyQt6.QtCore import QEventLoop, QSignalBlocker, pyqtSignal, Qt
+from PyQt6.QtCore import QTimer
 
 class DataFrameEditor(QDialog):
     """
     Simple popup window for editing a pandas DataFrame.
     """
+    updateFigs = pyqtSignal(tuple, object, dict, bool)
 
-    def __init__(self, df, valid_genes):
+    def __init__(self, df, valid_genes, extr_info, thresh):
         super().__init__()
 
+        
         # Save a copy of the dataframe.
         # We edit the copy so Cancel leaves the original untouched.
 
         self.df = df.copy()
-        self.valid_genes = valid_genes.copy()
+        self.valid_genes = valid_genes
+        self.extr_info = extr_info
+        self.thresh = thresh
+
+        self.column_thresholds = {
+            str(col): thresh for col in self.df.columns
+        }
+
+        self.active_column = None
 
         # Window settings
 
         self.setWindowTitle("DataFrame Editor")
         self.resize(800, 500)
 
-
-        self.waiting = None
-        self.finished = False # type: ignore
-        self.accepted = False # type: ignore
         self.result_df = None
 
         # Main vertical layout
 
         layout = QVBoxLayout(self)
 
+        #slider
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setMinimum(-300)
+        self.slider.setMaximum(300)
+        self.slider.setValue(int(round(self.thresh*100,0)))
+        self.slider.setSingleStep(1)
+
+        self.label = QLabel("Expression Threshold: 0.80")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._slider_timer = QTimer(self)
+        self._slider_timer.setSingleShot(True)
+        self._slider_timer.setInterval(150)  # ms after last movement
+        self.slider.valueChanged.connect(self.update_slabel)
+        self.slider.valueChanged.connect(lambda v: self._slider_timer.start())
+        self._slider_timer.timeout.connect(
+            lambda: self.updateFigs.emit(self.extr_info, self, self.column_thresholds, False)
+        )
+        self.slider.valueChanged.connect(self.slider_changed)
         # Spreadsheet widget
 
         self.table = QTableWidget()
@@ -56,10 +83,14 @@ class DataFrameEditor(QDialog):
         self.table.blockSignals(False)
 
         # Update colors whenever a user changes a cell
+        self.table.itemChanged.connect(self.make_caps)
         self.table.itemChanged.connect(self.cell_changed)
         self.update_colors()
         # Allow double-clicking column headers to rename them
-
+        
+        self.table.horizontalHeader().sectionClicked.connect( # type: ignore
+            self.select_column
+        )
         self.table.horizontalHeader().sectionDoubleClicked.connect( # type: ignore
             self.rename_column
         )
@@ -89,6 +120,9 @@ class DataFrameEditor(QDialog):
 
         button_layout.addWidget(ok_btn)
 
+        layout.addWidget(self.label)
+        layout.addWidget(self.slider)
+
         layout.addLayout(button_layout)
 
         # Connect buttons to functions
@@ -99,9 +133,10 @@ class DataFrameEditor(QDialog):
         add_col_btn.clicked.connect(self.add_column)
         remove_col_btn.clicked.connect(self.remove_column)
 
-        try_assosc_btn.clicked.connect(self.try_assosiation)
+        try_assosc_btn.clicked.connect(lambda: self.updateFigs.emit(self.extr_info, self, self.column_thresholds, True))
 
         ok_btn.clicked.connect(self.close_ok)
+
 
     # Fill the spreadsheet with the dataframe contents
 
@@ -125,14 +160,49 @@ class DataFrameEditor(QDialog):
                 item = QTableWidgetItem(str(self.df.iat[r, c]))
                 self.table.setItem(r, c, item)
     #wait for input
-    def wait_for_user(self):
+    #slider lable:
+    def update_slabel(self, value):
 
-        self.waiting = QEventLoop()
+        thresh = value / 100
 
-        self.waiting.exec()
+        if self.active_column:
+            self.label.setText(
+                f"{self.active_column} threshold: {thresh:.2f}"
+            )
+        else:
+            self.label.setText(
+                f"Threshold: {thresh:.2f}"
+            )
 
-        return self.result_df
+    def select_column(self, column):
 
+        header = self.table.horizontalHeaderItem(column)
+
+        if header is None:
+            return
+
+        self.active_column = header.text()
+
+        # Load that column's current threshold
+        value = self.column_thresholds.get(
+            self.active_column,
+            self.thresh
+        )
+
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(value * 100)) # type: ignore
+        self.slider.blockSignals(False)
+
+        self.label.setText(
+            f"{self.active_column} threshold: {value:.2f}"
+        )
+
+    def slider_changed(self, value):
+
+        new_thresh = value / 100
+
+        if self.active_column is not None:
+            self.column_thresholds[self.active_column] = new_thresh
     #when cell is changed
     def cell_changed(self, item):
 
@@ -140,13 +210,12 @@ class DataFrameEditor(QDialog):
         col = item.column()
 
         value = item.text()
-        with QSignalBlocker(self.table):
-            if value in self.valid_genes:
-                item.setBackground(QColor("#82FF82"))
-            elif value == None:
-                item.setBackground(QColor("#FFFFFF"))
-            else:
-                item.setBackground(QColor("#FF8282"))
+        if value in self.valid_genes:
+            item.setBackground(QColor("#82FF82"))
+        elif value == None:
+            item.setBackground(QColor("#FFFFFF"))
+        else:
+            item.setBackground(QColor("#FF8282"))
     # Add an empty row
     def update_colors(self):
 
@@ -179,18 +248,23 @@ class DataFrameEditor(QDialog):
             self.table.removeRow(row)
 
     # Add a new empty column
+    def make_caps(self, item):
+        # Block signals to prevent infinite loops when calling setText
+        self.blockSignals(True)
+        item.setText(item.text().upper())
+        self.blockSignals(False)
 
     def add_column(self):
 
         col = self.table.columnCount()
 
         self.table.insertColumn(col)
-
+        name = f"Column {col+1}" #eventually change name to user defined name!
         self.table.setHorizontalHeaderItem(
             col,
             QTableWidgetItem(f"Column {col+1}")
         )
-
+        self.column_thresholds[name] = self.thresh
         for r in range(self.table.rowCount()):
             self.table.setItem(r, col, QTableWidgetItem(""))
 
@@ -203,23 +277,6 @@ class DataFrameEditor(QDialog):
         if col >= 0:
             self.table.removeColumn(col)
     # Check validiity of table and update if valid
-
-    def try_assosiation(self):
-
-        current_df = self.get_dataframe()
-
-        is_valid = current_df.isin(self.valid_genes).all().all()
-
-        if is_valid:
-
-            self.result_df = current_df
-
-            # wake up wait_for_user()
-            if self.waiting is not None:
-                self.waiting.quit()
-
-            else:
-                print("Invalid association")
             
     # Rename a column by double-clicking its header
 
@@ -236,19 +293,14 @@ class DataFrameEditor(QDialog):
             "Column name:",
             text=old_name
         )
-
+        
         if ok and new_name:
+            self.column_thresholds[new_name] = self.column_thresholds.pop(old_name)
             item.setText(new_name)
 
     def close_ok(self):
 
-        self.accepted = True # type: ignore
-        self.finished = True # type: ignore
-
-        if self.waiting is not None:
-            self.waiting.quit()
-
-        self.close()
+        self.accept()
 
     # Convert spreadsheet back into a pandas DataFrame
 
