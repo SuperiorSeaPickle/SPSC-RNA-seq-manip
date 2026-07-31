@@ -22,20 +22,20 @@ from scipy.sparse import csc_matrix
 from sklearn.cluster import KMeans
 import seaborn as sns
 import matplotlib.pyplot as plt
-import matplotlib
+import matplotlib as mpl
 import matplotlib.colors as mcolors
 from typing import Literal
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QEventLoop
 import sys
 import spatialdata as sd
-import plotly.graph_objects as go
+import tifffile
 
-matplotlib.use("qtagg")
+mpl.use("qtagg")
 App = QApplication.instance() or QApplication(sys.argv)
 editor = None
 
-DATA_DIR = Path(r"C:\Users\bend2\Documents\PROJECTS\aterads test")
+DATA_DIR = Path(r"C:\Users\bend2\OneDrive\Documents\CFCE")
 
 
 def delete_file(fp):
@@ -556,9 +556,9 @@ def _recolor(info):
     groups = info[0].obs["annotation"]
     assigned_groups = [g for g in groups.cat.categories if g != "Unassigned"]
 
-    cmap1 = plt.get_cmap("tab20")
-    cmap2 = plt.get_cmap("tab20b")
-    cmap3 = plt.get_cmap("tab20c")
+    cmap1 = plt.get_cmap("tab20") # type: ignore
+    cmap2 = plt.get_cmap("tab20b")# type: ignore
+    cmap3 = plt.get_cmap("tab20c")# type: ignore
     colors_list = (
         [cmap1(i) for i in range(cmap1.N)] +
         [cmap2(i) for i in range(cmap2.N)] +
@@ -730,11 +730,14 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
     cell_vertecies = [np.array(b.exterior.coords) for b in cell_boundries]
     del cell_boundries,ordered_map, filtered_cells,cells
 
+    tf = tifffile.TiffFile(str(DATA_DIR / "morphology.ome.tif"))
+
     # type: ignore
     plot_window = ScatterPlotWindow(
         coords,
         tmp_cpd["unassinged"],
-        cell_vertecies
+        cell_vertecies,
+        tf
 
     )
 
@@ -784,7 +787,6 @@ def create_spatial_zarr(DATA_DIR, adata: ad.AnnData):
     from spatialdata.transformations import Identity,Scale
     import spatialdata_io as sdio
     import dask.array as da
-    import tifffile
     import zarr
     import inspect
 
@@ -977,6 +979,7 @@ if __name__ == "__main__":
     #format_h5(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
     #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
     #diff_analysis(view_plots=True, save_plots=True)
+    
     
     annotate_cells(mode="int",auto=False)
     # print("loading matrix...")
