@@ -11,12 +11,39 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
-    QInputDialog
+    QInputDialog,
+    QFileDialog,
+    QMenu,
+    QMainWindow
 )
 
-from PyQt6.QtGui import QColor
-from PyQt6.QtCore import QEventLoop, QSignalBlocker, pyqtSignal, Qt
-from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QColor, QAction
+
+from PyQt6.QtCore import pyqtSignal, Qt, QTimer, QEvent
+import pickle
+
+class DFE_data():
+    def __init__(self,df: pd.DataFrame, threshes: dict) -> None:
+        self.df = df
+        self.col_meta = {}
+        self.col_meta['thresholds'] = threshes
+
+    def save(self, file_path):
+        print("Saving:")
+        print(self.df)
+
+        with open(file_path, "wb") as file:
+            pickle.dump(self, file)
+
+    def load(self, file_path):
+        with open(file_path, "rb") as file:
+            loaded = pickle.load(file)
+
+        print(type(loaded))
+        print(loaded)
+
+        self.df = loaded.df
+        self.col_meta = loaded.col_meta
 
 class DataFrameEditor(QDialog):
     """
@@ -49,6 +76,7 @@ class DataFrameEditor(QDialog):
 
         self.result_df = None
 
+        self.pressed_keys = set()
         # Main vertical layout
 
         layout = QVBoxLayout(self)
@@ -100,20 +128,19 @@ class DataFrameEditor(QDialog):
         button_layout = QHBoxLayout()
 
         add_row_btn = QPushButton("Add Row")
-        remove_row_btn = QPushButton("Remove Row")
 
         add_col_btn = QPushButton("Add Column")
-        remove_col_btn = QPushButton("Remove Column")
+
+        load_config_btn = QPushButton("Load Config")
 
         try_assosc_btn = QPushButton("Try Assosiation")
 
         ok_btn = QPushButton("OK")
 
         button_layout.addWidget(add_row_btn)
-        button_layout.addWidget(remove_row_btn)
 
         button_layout.addWidget(add_col_btn)
-        button_layout.addWidget(remove_col_btn)
+        button_layout.addWidget(load_config_btn)
 
         button_layout.addStretch()
         button_layout.addWidget(try_assosc_btn)
@@ -128,10 +155,9 @@ class DataFrameEditor(QDialog):
         # Connect buttons to functions
 
         add_row_btn.clicked.connect(self.add_row)
-        remove_row_btn.clicked.connect(self.remove_row)
 
         add_col_btn.clicked.connect(self.add_column)
-        remove_col_btn.clicked.connect(self.remove_column)
+        load_config_btn.clicked.connect(self.load_file)
 
         try_assosc_btn.clicked.connect(lambda: self.updateFigs.emit(self.extr_info, self, self.column_thresholds, True))
 
@@ -142,6 +168,7 @@ class DataFrameEditor(QDialog):
 
     def load_dataframe(self):
 
+        self.table.clear()
         self.table.setRowCount(len(self.df))
         self.table.setColumnCount(len(self.df.columns))
 
@@ -159,7 +186,33 @@ class DataFrameEditor(QDialog):
             for c in range(len(self.df.columns)):
                 item = QTableWidgetItem(str(self.df.iat[r, c]))
                 self.table.setItem(r, c, item)
-    #wait for input
+    #del collumn
+    def keyPressEvent(self, a0):
+        assert a0 is not None
+        if (
+            a0.key() == Qt.Key.Key_Delete
+            and a0.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            self.remove_row()
+
+        elif a0.key() == Qt.Key.Key_Delete:
+            self.remove_column()
+
+        elif (
+            a0.key() == Qt.Key.Key_S
+            and a0.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self.save_file()
+        elif a0.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            # Move to the cell below
+            row = self.table.currentRow()
+            col = self.table.currentColumn()
+            if row < self.table.rowCount() - 1:
+                self.table.setCurrentCell(row + 1, col)
+        
+        else:
+            super().keyPressEvent(a0)
+
     #slider lable:
     def update_slabel(self, value):
 
@@ -344,3 +397,43 @@ class DataFrameEditor(QDialog):
         # Return dataframe
 
         return pd.DataFrame(data, columns=headers)
+    def save_file(self):
+        config = DFE_data(self.get_dataframe(), self.column_thresholds)
+        # Open native cross-platform save dialog
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save File",
+            "",
+            "Data Files (*.dat);;All Files (*)"
+        )
+        
+        # If user didn't cancel, write the file
+        if file_path:
+            config.save(file_path)
+
+    def load_file(self):
+        loaded_config = DFE_data(pd.DataFrame(), {})
+        # Open native cross-platform open dialog
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open File",
+            "",
+            "Data Files (*.dat);;All Files (*)"
+        )
+        
+        # If user selected a file, read it
+        if file_path:
+            self.table.blockSignals(True)
+            loaded_config.load(file_path)
+            self.df = loaded_config.df
+            self.column_thresholds = loaded_config.col_meta['thresholds']
+
+            print(loaded_config.df)
+            print(self.df)
+            print(self.table.rowCount(), self.table.columnCount())
+
+            self.load_dataframe()
+            self.table.viewport().update() # type: ignore
+            self.update_colors()
+
+            self.table.blockSignals(False)

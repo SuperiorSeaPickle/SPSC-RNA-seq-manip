@@ -1,4 +1,5 @@
 import pandas as pd
+import geopandas as gpd
 import numpy as np
 import plotly.express as px
 import pyarrow.parquet as pq
@@ -575,6 +576,7 @@ def _recolor(info):
     colors = lut[codes]
 
     info[2].set_facecolors(colors)
+    info[3].set_facecolors(colors)
     info[1].update_legend(color_map)   # <-- new
     info[1].canvas.draw_idle()
 def update_figs(info, app, thresh, recomp=True):
@@ -632,7 +634,6 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
 
     print("loading matrix...")
     adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
-    print(adata)
     diff_output = pd.DataFrame(adata.uns['rank_genes_groups']["names"]).head(10)
     cell_annots = {}
     tmp_cpd = {
@@ -718,9 +719,23 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
 
     coords = adata.obsm["X_umap"]
     adata.obs["annotation"] = "Unassigned"
+    with open(DATA_DIR / "tmp" / "cell_objects_loaded.pkl", "rb") as f:
+        cells = pickle.load(f)
+
+    
+    ordered_map = {name: i for i, name in enumerate(adata.obs_names)}
+    filtered_cells = [x for x in cells if x.id in ordered_map]
+    filtered_cells.sort(key=lambda x: ordered_map[x.id])
+    cell_boundries = [c.boundry for c in filtered_cells]
+    cell_vertecies = [np.array(b.exterior.coords) for b in cell_boundries]
+    del cell_boundries,ordered_map, filtered_cells,cells
+
+    # type: ignore
     plot_window = ScatterPlotWindow(
         coords,
-        tmp_cpd["unassinged"]
+        tmp_cpd["unassinged"],
+        cell_vertecies
+
     )
 
     plot_window.show()
@@ -728,7 +743,8 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
     ext_info = (
         adata,
         plot_window,
-        plot_window.scatter
+        plot_window.scatter,
+        plot_window.poly_collection
     )
     if mode == "int":
 
@@ -769,7 +785,6 @@ def create_spatial_zarr(DATA_DIR, adata: ad.AnnData):
     import spatialdata_io as sdio
     import dask.array as da
     import tifffile
-    import geopandas as gpd
     import zarr
     import inspect
 
@@ -958,7 +973,6 @@ def total_count_scatter():
 
     fig.show(config={'scrollZoom': True})
 if __name__ == "__main__":
-    import napari
     #assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
     #format_h5(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
     #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
