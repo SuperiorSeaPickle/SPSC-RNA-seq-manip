@@ -35,7 +35,7 @@ mpl.use("qtagg")
 App = QApplication.instance() or QApplication(sys.argv)
 editor = None
 
-DATA_DIR = Path(r"C:\Users\bend2\OneDrive\Documents\CFCE")
+DATA_DIR = Path(r"C:\Users\bend2\Documents\PROJECTS\aterads test")
 
 
 def delete_file(fp):
@@ -980,6 +980,10 @@ if __name__ == "__main__":
     #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
     #diff_analysis(view_plots=True, save_plots=True)
     
+    with tifffile.TiffFile(str(DATA_DIR / "morphology.ome.tif")) as tif:
+        xml_string = tif.ome_metadata
+        print(xml_string)
+
     
     annotate_cells(mode="int",auto=False)
     # print("loading matrix...")
