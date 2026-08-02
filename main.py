@@ -11,6 +11,7 @@ import shapely
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
 from cell import cell
+from pyrmid_generator import create_zarr_pyramid
 from DataFrameEditor import DataFrameEditor
 from plot_window import ScatterPlotWindow
 import duckdb
@@ -30,12 +31,14 @@ from PyQt6.QtCore import QEventLoop
 import sys
 import spatialdata as sd
 import tifffile
+import zarr
+from skimage import transform
 
 mpl.use("qtagg")
 App = QApplication.instance() or QApplication(sys.argv)
 editor = None
 
-DATA_DIR = Path(r"C:\Users\bend2\Documents\PROJECTS\aterads test")
+DATA_DIR = Path(r"C:\Users\bend2\OneDrive\Documents\CFCE")
 
 
 def delete_file(fp):
@@ -55,6 +58,7 @@ def df_to_cells(boundries_df):
     if (Path(DATA_DIR) / 'tmp'/ 'cell_objects_loaded.pkl').is_file():
         with open(Path(DATA_DIR) / 'tmp'/ 'cell_objects_loaded.pkl', "rb") as file:
             cells = pickle.load(file)
+ 
     else:
         TOTAL_CELLS = boundries_df['cell_id'].nunique()
         last_cell_id = None
@@ -525,7 +529,17 @@ def diff_analysis(view_plots = True, save_plots=False):
     marker_df = pd.DataFrame(adata.uns['rank_genes_groups']['names']).head(20)
     print(marker_df)
 
+def pyrimidize_morphology():
 
+    for file in (DATA_DIR / "morphology_focus").iterdir():
+        if file.is_file():
+            create_zarr_pyramid(
+                file,
+                DATA_DIR / "morphology_focus" / "pyrimidized" /("pyrimidized_" + str(file.name)),
+                downsample_factor=2,
+                n_levels=6,
+                tile_size=1024,
+            )
 def validate_user_input(comm_dict, gene_dict):
     
     while True:
@@ -730,14 +744,22 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
     cell_vertecies = [np.array(b.exterior.coords) for b in cell_boundries]
     del cell_boundries,ordered_map, filtered_cells,cells
 
-    tf = tifffile.TiffFile(str(DATA_DIR / "morphology.ome.tif"))
+    tfs = [
+        f.absolute()
+        for f in (DATA_DIR / "morphology_focus" / "pyrimidized").iterdir()
+    ]
 
+    tfs = sorted(tfs, key=lambda x: x.name)
+    hetfs = tifffile.TiffFile(str(DATA_DIR / "WTA_Preview_FFPE_Breast_Cancer_he_image.ome.tif")) #..FILENAME
     # type: ignore
     plot_window = ScatterPlotWindow(
         coords,
         tmp_cpd["unassinged"],
         cell_vertecies,
-        tf
+        tfs,
+        hetfs,
+        [1,0,0]
+
 
     )
 
@@ -787,7 +809,6 @@ def create_spatial_zarr(DATA_DIR, adata: ad.AnnData):
     from spatialdata.transformations import Identity,Scale
     import spatialdata_io as sdio
     import dask.array as da
-    import zarr
     import inspect
 
     print(sd.__version__)
@@ -980,11 +1001,11 @@ if __name__ == "__main__":
     #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
     #diff_analysis(view_plots=True, save_plots=True)
     
-    with tifffile.TiffFile(str(DATA_DIR / "morphology.ome.tif")) as tif:
+    with tifffile.TiffFile(str(DATA_DIR / "morphology_focus" / "ch0000_dapi.ome.tif")) as tif:
         xml_string = tif.ome_metadata
         print(xml_string)
 
-    
+    #pyrimidize_morphology()
     annotate_cells(mode="int",auto=False)
     # print("loading matrix...")
     # adata = sc.read_h5ad(str(DATA_DIR / "tmp" / "adata_tmp.h5ad"))
