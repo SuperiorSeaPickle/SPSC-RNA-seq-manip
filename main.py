@@ -32,13 +32,13 @@ import sys
 import spatialdata as sd
 import tifffile
 import zarr
-from skimage import transform
+import cv2
 
 mpl.use("qtagg")
 App = QApplication.instance() or QApplication(sys.argv)
 editor = None
 
-DATA_DIR = Path(r"C:\Users\bend2\OneDrive\Documents\CFCE")
+DATA_DIR = Path(r"C:\Users\bend2\Documents\PROJECTS\aterads test")
 
 
 def delete_file(fp):
@@ -641,6 +641,126 @@ def annotation_complete():
     df = editor.get_dataframe()
 
     print("Annotation Complete")
+
+def extract_hematoxylin(he_image):
+    # Ensure channels are last: (C, H, W) -> (H, W, C)
+    if he_image.ndim == 3 and he_image.shape[0] in (3, 4):
+        he_image = np.moveaxis(he_image, 0, -1)
+
+    # If 4-channel (RGBA), slice to 3 channels (RGB)
+    if he_image.ndim == 3 and he_image.shape[2] == 4:
+        he_image = he_image[:, :, :3]
+
+    gray = cv2.cvtColor(he_image, cv2.COLOR_BGR2GRAY)
+    inverted_gray = cv2.bitwise_not(gray)
+    return inverted_gray
+def prep_for_sift(img):
+    # 1. Remove trailing/leading 1-dimensions
+    img = np.squeeze(img)[6]
+    
+    # 2. Check if empty
+    if img is None or img.size == 0:
+        raise ValueError("Input image is empty or failed to load!")
+        
+    # 3. Handle non-finite numbers (NaNs/Infs) if present
+    if not np.isfinite(img).all():
+        img = np.nan_to_num(img)
+
+    # 4. Convert to 8-bit uint8
+    if img.dtype != np.uint8:
+        # Scale range [min, max] -> [0, 255]
+        img_norm = cv2.normalize(img, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX) # type: ignore
+        img_8u = img_norm.astype(np.uint8)
+    else:
+        img_8u = img
+
+    return img_8u
+def level_shape(path, level, series=0):
+    with tifffile.TiffFile(path) as tf:
+        return tf.series[series].levels[level].shape
+def align_images(he_path, dapi_path, lvl=4):
+    matr_loc = DATA_DIR/"tmp"/"he_affine_transform.csv"
+    if (matr_loc).is_file():
+        affine_matrix = np.loadtxt(str(matr_loc), delimiter=',')
+        return affine_matrix
+    # 1. Load the images
+    # he_image: Moving image (RGB)
+    # dapi_image: Fixed reference image (Grayscale/Single-channel)
+    he_image = tifffile.imread(he_path, series=0, level=lvl)
+    dapi_image = tifffile.imread(dapi_path, series=0, level=lvl)
+
+    dapi_image = prep_for_sift(dapi_image)
+
+    he_shape_lvl  = level_shape(he_path, lvl)
+    he_shape_0    = level_shape(he_path, 0)
+    dapi_shape_lvl = level_shape(dapi_path, lvl)
+    dapi_shape_0   = level_shape(dapi_path, 0)
+
+    he_ds_x = he_shape_0[-1] / he_shape_lvl[-1]
+    he_ds_y = he_shape_0[-2] / he_shape_lvl[-2]
+    dapi_ds_x = dapi_shape_0[-1] / dapi_shape_lvl[-1]
+    dapi_ds_y = dapi_shape_0[-2] / dapi_shape_lvl[-2]
+
+    print("HE level0 shape:", he_shape_0, " level%d shape:" % lvl, he_shape_lvl)
+    print("DAPI level0 shape:", dapi_shape_0, " level%d shape:" % lvl, dapi_shape_lvl)
+    print("HE downsample x/y:", he_ds_x, he_ds_y)
+    print("DAPI downsample x/y:", dapi_ds_x, dapi_ds_y)
+    
+    # 2. Preprocess H&E to match DAPI's modality (bright nuclei on dark background)
+    he_processed = extract_hematoxylin(he_image)
+    
+    # 3. Initialize SIFT detector
+    sift = cv2.SIFT_create() # type: ignore
+    
+    # 4. Find keypoints and descriptors
+    kp_he, des_he = sift.detectAndCompute(he_processed, None)
+    kp_dapi, des_dapi = sift.detectAndCompute(dapi_image, None)
+    
+    # 5. Match features using FLANN Matcher
+    FLANN_INDEX_KDTREE = 1
+    index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+    search_params = dict(checks=50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params) # type: ignore
+    
+    matches = flann.knnMatch(des_he, des_dapi, k=2)
+    
+    # 6. Filter matches using Lowe's ratio test
+    good_matches = []
+    for m, n in matches:
+        if m.distance < 0.7 * n.distance:
+            good_matches.append(m)
+            
+    if len(good_matches) < 3:
+        raise ValueError("Not enough matching keypoints found between images.")
+        
+    # 7. Extract coordinates of matched keypoints
+    src_pts = np.float32([kp_he[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2) # type: ignore
+    dst_pts = np.float32([kp_dapi[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2) # type: ignore
+    
+    # 8. Estimate Affine Transformation Matrix (accounts for rotation, scale, translation)
+    # RANSAC cleans out false geometric matches
+    affine_matrix, inliers = cv2.estimateAffine2D(src_pts, dst_pts, method=cv2.RANSAC)
+
+    print("good_matches:", len(good_matches))
+    print("inliers:", int(inliers.sum()) if inliers is not None else None, "/", len(inliers) if inliers is not None else 0)
+    print("raw affine_matrix:\n", affine_matrix)
+
+    a, b = affine_matrix[0, 0], affine_matrix[0, 1]
+    c, d = affine_matrix[1, 0], affine_matrix[1, 1]
+    col1_norm = np.hypot(a, c)  # effective x-scale
+    col2_norm = np.hypot(b, d)  # effective y-scale
+    print("column norms (x-scale, y-scale):", col1_norm, col2_norm)
+    print("anisotropy ratio:", col2_norm / col1_norm)
+
+    scale_to_level0 = 2**lvl  # 2^4 = 16
+    affine_matrix[0, 2] *= scale_to_level0
+    affine_matrix[1, 2] *= scale_to_level0
+
+
+    np.savetxt(str(DATA_DIR/"tmp"/"he_affine_transform.csv"), affine_matrix, delimiter=',')
+    
+    return affine_matrix
+
     
 def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
     import celltypist
@@ -751,6 +871,7 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
 
     tfs = sorted(tfs, key=lambda x: x.name)
     hetfs = tifffile.TiffFile(str(DATA_DIR / "WTA_Preview_FFPE_Breast_Cancer_he_image.ome.tif")) #..FILENAME
+    trans_matrix = align_images(str(DATA_DIR / "WTA_Preview_FFPE_Breast_Cancer_he_image.ome.tif"), str(DATA_DIR / "morphology.ome.tif"))
     # type: ignore
     plot_window = ScatterPlotWindow(
         coords,
@@ -758,7 +879,7 @@ def annotate_cells(mode: Literal["cmd", "int"], auto=True, view_figures= True):
         cell_vertecies,
         tfs,
         hetfs,
-        [1,0,0]
+        trans_matrix
 
 
     )
@@ -1000,10 +1121,7 @@ if __name__ == "__main__":
     #format_h5(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
     #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
     #diff_analysis(view_plots=True, save_plots=True)
-    
-    with tifffile.TiffFile(str(DATA_DIR / "morphology_focus" / "ch0000_dapi.ome.tif")) as tif:
-        xml_string = tif.ome_metadata
-        print(xml_string)
+
 
     #pyrimidize_morphology()
     annotate_cells(mode="int",auto=False)

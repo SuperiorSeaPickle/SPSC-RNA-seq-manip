@@ -2,6 +2,7 @@
 
 # OBJECTIVES
 ATERA
+
 - Differences between visum, xenium, and ATERA in terms of chemistry of the reaction, transcriptomic probe panel (coverage), design of custom probes, resolution of the images, number of samples that can be processed.
 - Padlock probes and bits (codeword bits) differences with Xenium?
 - How combine gene expression data and imaging data (applications)
@@ -49,4 +50,4 @@ ATERA
           ↓
 - Visualization
 
-goal
+## UI Formation

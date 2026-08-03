@@ -13,6 +13,8 @@ from PyQt6 import QtWidgets, QtCore
 
 from PyQt6.QtCore import Qt, QTimer
 
+import cv2
+
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt import NavigationToolbar2QT
@@ -20,6 +22,7 @@ from superqt import QRangeSlider
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Polygon
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.transforms import Affine2D
 from pathlib import Path
 import numpy as np
 import dask.array as da
@@ -27,7 +30,6 @@ from skimage.transform import resize
 import zarr
 
 INTERP = "bicubic"
-
 class LayerContraster(QtWidgets.QWidget):
 
     def __init__(self, title: str, toggle_conn, contrast_conn, contrast_conn_par, color, initial_checked: bool = False, parent=None):
@@ -231,9 +233,8 @@ class ScatterPlotWindow(QMainWindow):
             "rna":  (self.morphology_levels[2], "gray"),
             "prot": (self.morphology_levels[3], "gray"),
         }
-        self.sfactor = tf_transform[0]
-        self.ytrans = tf_transform[1]
-        self.xtrans = tf_transform[2]
+
+        self.he_transform_matrix = np.asarray(tf_transform, dtype=np.float64)
 
         # Per-layer cache of the last-loaded viewport crop (pre-contrast),
         # so the contrast slider can re-apply without re-reading from disk.
@@ -256,7 +257,6 @@ class ScatterPlotWindow(QMainWindow):
         # Draw the initial background tile(s) once the window has a real size.
         self.showMaximized()
         QTimer.singleShot(100, self.update_background)
-
     @staticmethod
     def _open_zarr_levels(source) -> list:
         """
@@ -310,25 +310,30 @@ class ScatterPlotWindow(QMainWindow):
 
     def _select_pyramid_level(self, levels, viewport_width):
         """
-        Picks the coarsest resolution level that still provides at least
-        one image pixel per screen pixel for the current viewport width -
-        the same rule the original single-image pyramid picker used.
-        Layers with only one level (no pyramid) always return level 0.
+        Select the coarsest pyramid level that still has at least
+        one pyramid pixel per screen pixel.
         """
         if len(levels) == 1:
             return 0
 
         dpr = self.canvas2.devicePixelRatioF()
         screen_width = max(self.canvas2.width() * dpr, 1)
+
         pixels_per_screen_pixel = viewport_width / screen_width
 
         full_width = levels[0].shape[-1]
+
+        selected = 0
+
         for i, level in enumerate(levels):
             downsample = full_width / level.shape[-1]
-            if downsample >= pixels_per_screen_pixel:
-                return i
-        return max(0, len(levels) - 2)
 
+            if downsample <= pixels_per_screen_pixel:
+                selected = i
+            else:
+                break
+
+        return selected
     def _read_tile(self, level, y0, y1, x0, x1, kind):
         """
         Reads the [y0:y1, x0:x1] crop out of a resolution level, only
@@ -554,59 +559,81 @@ class ScatterPlotWindow(QMainWindow):
     # get level 0. Either way, only the crop overlapping the current
     # viewport is ever read off disk.
     def _load_tile_for_layer(self, layer_key):
-        """
-        Synchronously loads the tile crop for `layer_key` matching the current viewport
-        directly into `self.current_tiles` and updates contrast data on its artist.
-        """
         levels, kind = self.image_sources[layer_key]
-        
-        # Get current viewport limits
+
         x_lo, x_hi = self.ax2.get_xlim()
         xmin, xmax = min(x_lo, x_hi), max(x_lo, x_hi)
         y_lo, y_hi = self.ax2.get_ylim()
         ymin, ymax = min(y_lo, y_hi), max(y_lo, y_hi)
 
-        level_index = self._select_pyramid_level(levels, xmax - xmin)
+        if layer_key == "he":
+            # xmin/xmax/ymin/ymax above are in DAPI/display space. HE lives
+            # in its own pixel space related to display space by
+            # he_transform_matrix, so map the viewport corners back through
+            # the inverse affine to know which HE pixels to actually read -
+            # using display-space coords directly here was the bug: it read
+            # an arbitrary small/offset patch of the HE pyramid instead of
+            # the patch that actually corresponds to the current view.
+            inv = cv2.invertAffineTransform(self.he_transform_matrix.astype(np.float32))
+            corners = np.array(
+                [[xmin, ymin], [xmax, ymin], [xmin, ymax], [xmax, ymax]],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            he_corners = cv2.transform(corners, inv).reshape(-1, 2)
+            crop_xmin, crop_ymin = he_corners.min(axis=0)
+            crop_xmax, crop_ymax = he_corners.max(axis=0)
+        else:
+            crop_xmin, crop_xmax, crop_ymin, crop_ymax = xmin, xmax, ymin, ymax
+
+        if layer_key == "he":
+            inv = cv2.invertAffineTransform(self.he_transform_matrix.astype(np.float32))
+            corners = np.array(
+                [[xmin, ymin], [xmax, ymin], [xmin, ymax], [xmax, ymax]],
+                dtype=np.float32,
+            ).reshape(-1, 1, 2)
+            he_corners = cv2.transform(corners, inv).reshape(-1, 2)
+            crop_xmin, crop_ymin = he_corners.min(axis=0)
+            crop_xmax, crop_ymax = he_corners.max(axis=0)
+            print("display viewport (xmin,xmax,ymin,ymax):", xmin, xmax, ymin, ymax)
+            print("HE crop box (xmin,xmax,ymin,ymax):", crop_xmin, crop_xmax, crop_ymin, crop_ymax)
+            print("HE crop size:", crop_xmax - crop_xmin, crop_ymax - crop_ymin)
+    
+        level_index = self._select_pyramid_level(levels, crop_xmax - crop_xmin)
         level = levels[level_index]
+        print(
+            f"HE viewport width={crop_xmax-crop_xmin:.1f}, "
+            f"selected level={level_index}, "
+            f"level shape={level.shape}"
+        )
 
         full_width = levels[0].shape[-1]
         level_height, level_width = level.shape[-2], level.shape[-1]
         downsample = full_width / level_width
 
-        x0 = max(0, int(xmin / downsample))
-        x1 = min(level_width, int(np.ceil(xmax / downsample)))
-        y0 = max(0, int(ymin / downsample))
-        y1 = min(level_height, int(np.ceil(ymax / downsample)))
+        x0 = max(0, int(crop_xmin / downsample))
+        x1 = min(level_width, int(np.ceil(crop_xmax / downsample)))
+        y0 = max(0, int(crop_ymin / downsample))
+        y1 = min(level_height, int(np.ceil(crop_ymax / downsample)))
 
         if x1 <= x0 or y1 <= y0:
             return None
 
-        # Check region cache to prevent redundant disk I/O
         region = (level_index, x0, x1, y0, y1)
         if self._last_regions.get(layer_key) == region and layer_key in self.current_tiles:
             return self.current_tiles[layer_key]
-
         self._last_regions[layer_key] = region
 
-        # Read tile synchronously off disk and store in cache
         tile = self._read_tile(level, y0, y1, x0, x1, kind)
         self.current_tiles[layer_key] = np.asarray(tile).astype(np.float32)
-        
-        # Update spatial extent
 
-        # Apply scale directly to the display extent (no pixel data is modified!)
         self.image_metadata[layer_key][1].set_extent(
-            (
-                x0 * downsample * self.sfactor + self.xtrans, 
-                x1 * downsample * self.sfactor + self.xtrans, 
-                y1 * downsample * self.sfactor + self.ytrans, 
-                y0 * downsample * self.sfactor + self.ytrans
-            )
+            (x0 * downsample, x1 * downsample, y1 * downsample, y0 * downsample)
         )
-        
-        # CRITICAL: Force contrast calculation to populate the artist array!
+        if layer_key == "he":
+            self.image_metadata[layer_key][1].set_transform(self._he_display_transform())
+        else:
+            self.image_metadata[layer_key][1].set_transform(self.ax2.transData)
         self.apply_contrast(layer_key, redraw=False)
-        
         return self.current_tiles[layer_key]
     def update_background(self, event=None):
         """
@@ -648,8 +675,13 @@ class ScatterPlotWindow(QMainWindow):
     def toggle_cells(self):
         visible = self.toggleCB.isChecked()
         self.poly_collection.set_visible(visible)
-        self.figure2.canvas.draw()
-        self.update_background()
+
+        if self.image_metadata["he"][2].toggle.isChecked():
+            self.apply_contrast("he", redraw=False)
+        else:
+            self.combine_images()
+
+        self.canvas2.draw_idle()
 
     def toggle_layer(self, layer_key, state):
         """Show/hide background layers with mutual exclusion between H&E and morphology."""
@@ -719,6 +751,11 @@ class ScatterPlotWindow(QMainWindow):
         np.clip(img, 0, 1, out=img)
 
         # Update layer's Matplotlib artist
+        if layer_key == "he" and self.toggleCB.isChecked():
+            # Convert H&E to grayscale when annotations are visible
+            gray = np.dot(img[..., :3], [0.2989, 0.5870, 0.1140])
+            img = np.stack([gray, gray, gray], axis=-1)
+
         self.image_metadata[layer_key][1].set_data(img)
 
         widget.contrast_label.setText(
@@ -730,6 +767,9 @@ class ScatterPlotWindow(QMainWindow):
             self.combine_images()
         elif redraw:
             self.canvas2.draw_idle()
+        if layer_key == "he":
+            self.image_metadata[layer_key][1].set_transform(self._he_display_transform())
+            print("HE transform matrix:\n", self.image_metadata[layer_key][1].get_transform().get_matrix())
     def combine_images(self):
         # 1. Gather all active morphology layers
         active_layers = [
@@ -798,6 +838,26 @@ class ScatterPlotWindow(QMainWindow):
             self.composite_artist.set_visible(True)
 
         self.canvas2.draw_idle()
+    def _he_display_transform(self):
+        """
+        Builds the Matplotlib Affine2D that maps HE pixel space -> display
+        (DAPI) space, from the raw cv2 2x3 affine matrix.
+
+        cv2 convention:   x' = a*x + b*y + tx ; y' = c*x + d*y + ty
+            M = [[a, b, tx],
+                [c, d, ty]]
+
+        Matplotlib's Affine2D.from_values(A, B, C, D, E, F) convention:
+            x' = A*x + C*y + E ; y' = B*x + D*y + F
+
+        So the b/c terms swap position when handed to from_values - this
+        is the whole reason a straight scale-only decomposition (the old
+        decompose_affine_matrix) silently dropped rotation/shear: it threw
+        away exactly the b/c terms being preserved here.
+        """
+        a, b, tx = self.he_transform_matrix[0]
+        c, d, ty = self.he_transform_matrix[1]
+        return Affine2D.from_values(a, c, b, d, tx, ty) + self.ax2.transData
 
     # ==================================================================
     # LEGEND
