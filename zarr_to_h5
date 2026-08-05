@@ -1,0 +1,207 @@
+import json
+import sys
+import zarr
+import h5py
+import numpy as np
+
+ATTR_SIZE_LIMIT = 60_000  # stay safely under HDF5's ~64KB compact-attr limit
+
+# Zarr v2 uses zarr.hierarchy.Group / zarr.core.Array
+# Zarr v3 uses zarr.Group / zarr.Array directly
+try:
+    ZARR_GROUP_TYPES = (zarr.hierarchy.Group,)
+except AttributeError:
+    ZARR_GROUP_TYPES = (zarr.Group,)
+
+
+def is_group(obj):
+    return isinstance(obj, ZARR_GROUP_TYPES)
+
+
+def zarr_to_h5(zarr_path, h5_path, compression="gzip"):
+    """Recursively copy a Zarr store into an HDF5 file (Zarr v2 or v3)."""
+
+    src = zarr.open(zarr_path, mode="r")
+
+    with h5py.File(h5_path, "w") as dst:
+
+        def copy_attrs(zarr_obj, h5_obj):
+            for key, val in dict(zarr_obj.attrs).items():
+                try:
+                    if isinstance(val, (dict, list)):
+                        size = len(json.dumps(val).encode("utf-8"))
+                    elif isinstance(val, str):
+                        size = len(val.encode("utf-8"))
+                    else:
+                        size = sys.getsizeof(val)
+
+                    if size > ATTR_SIZE_LIMIT:
+                        raise ValueError("too large for a compact attribute")
+
+                    h5_obj.attrs[key] = val
+
+                except (ValueError, OSError, TypeError):
+                    fallback_name = f"_attr_{key}"
+
+                    if isinstance(val, (dict, list)):
+                        payload = json.dumps(val)
+                    else:
+                        payload = val
+
+                    dt = h5py.string_dtype("utf-8")
+
+                    if fallback_name in h5_obj:
+                        del h5_obj[fallback_name]
+
+                    h5_obj.create_dataset(
+                        fallback_name,
+                        data=str(payload),
+                        dtype=dt,
+                    )
+                    print(
+                        f"  Attribute '{key}' too large ({size:,} bytes) "
+                        f"-> stored as dataset '{fallback_name}'"
+                    )
+
+        def copy_node(zarr_group, h5_group):
+            copy_attrs(zarr_group, h5_group)
+
+            for name in zarr_group.keys():
+                item = zarr_group[name]
+
+                if is_group(item):
+                    h5_subgroup = h5_group.create_group(name)
+                    copy_node(item, h5_subgroup)
+                else:
+                    arr = item[:]
+
+                    if arr.dtype == object or arr.dtype.kind in ("U", "S"):
+                        dt = h5py.string_dtype("utf-8")
+                        arr = arr.astype(str).astype(object)
+                        ds = h5_group.create_dataset(
+                            name, data=arr, dtype=dt, compression=compression
+                        )
+                    else:
+                        ds = h5_group.create_dataset(
+                            name, data=arr, compression=compression
+                        )
+
+                    copy_attrs(item, ds)
+
+        copy_node(src, dst)
+
+    print(f"Converted {zarr_path} -> {h5_path}")
+def print_h5_tree(h5_path):
+    def visitor(name, obj):
+        kind = "Group" if isinstance(obj, h5py.Group) else "Dataset"
+        depth = name.count("/")
+        print("  " * depth + f"{name.split('/')[-1]}  [{kind}]")
+
+    with h5py.File(h5_path, "r") as f:
+        print(f.filename)
+        f.visititems(visitor)
+def inspect_zarr(path):
+    root = zarr.open(path, mode="r")
+
+    def walk(group, prefix=""):
+        print(f"{prefix}[Group] {group.path or '/'}")
+        for key, val in dict(group.attrs).items():
+            preview = json.dumps(val)[:120]
+            print(f"{prefix}  attr: {key} = {preview}")
+
+        for name in group.keys():
+            item = group[name]
+            if hasattr(item, "keys"):  # it's a group
+                walk(item, prefix + "  ")
+            else:  # it's an array
+                print(f"{prefix}  [Array] {name}  shape={item.shape}  dtype={item.dtype}")
+                for key, val in dict(item.attrs).items():
+                    preview = json.dumps(val)[:120]
+                    print(f"{prefix}    attr: {key} = {preview}")
+
+    walk(root)
+
+CHUNK = 20_000_000
+def copy_array_chunked(zarr_arr, h5_group, name, dtype, compression="gzip"):
+    ds = h5_group.create_dataset(
+        name, shape=zarr_arr.shape, dtype=dtype, compression=compression
+    )
+    n = zarr_arr.shape[0]
+    for start in range(0, n, CHUNK):
+        end = min(start + CHUNK, n)
+        ds[start:end] = zarr_arr[start:end]
+        print(f"  {name}: {end:,}/{n:,}")
+    return ds
+
+def zarr_to_10x_h5(zarr_path, h5_path):
+    root = zarr.open(zarr_path, mode="r")
+
+    feature_ids = json.loads(root.attrs["feature_ids"]) if isinstance(
+        root.attrs["feature_ids"], str
+    ) else list(root.attrs["feature_ids"])
+    feature_names = json.loads(root.attrs["feature_keys"]) if isinstance(
+        root.attrs["feature_keys"], str
+    ) else list(root.attrs["feature_keys"])
+    feature_types_raw = json.loads(root.attrs["feature_types"]) if isinstance(
+        root.attrs["feature_types"], str
+    ) else list(root.attrs["feature_types"])
+
+    # map source label -> 10x standard label
+    type_map = {"gene": "Gene Expression"}
+    feature_types = [type_map.get(t, t) for t in feature_types_raw]
+
+    n_features = root.attrs["number_features"]
+    n_cells = root.attrs["number_cells"]
+
+    cell_id = root["cell_id"][:]  # (n_cells, 2) uint32
+    # ASSUMPTION: no true barcode string exists in this store, so we
+    # synthesize one from the two numeric ID columns. Replace this line
+    # if you have real barcode sequences to join in instead.
+    barcodes = [f"{a}-{b}" for a, b in cell_id]
+
+    dt = h5py.string_dtype("utf-8")
+
+    with h5py.File(h5_path, "w") as f:
+        matrix = f.create_group("matrix")
+
+        print("Copying data...")
+        copy_array_chunked(root["csc"]["data"], matrix, "data", np.int32)
+
+        print("Copying indices...")
+        copy_array_chunked(root["csc"]["indices"], matrix, "indices", np.int32)
+
+        print("Copying indptr...")
+        copy_array_chunked(root["csc"]["indptr"], matrix, "indptr", np.int32)
+
+        matrix.create_dataset(
+            "shape", data=np.array([n_features, n_cells], dtype=np.int32)
+        )
+
+        matrix.create_dataset(
+            "barcodes", data=np.asarray(barcodes, dtype=object), dtype=dt
+        )
+
+        features = matrix.create_group("features")
+        features.create_dataset(
+            "id", data=np.asarray(feature_ids, dtype=object), dtype=dt
+        )
+        features.create_dataset(
+            "name", data=np.asarray(feature_names, dtype=object), dtype=dt
+        )
+        features.create_dataset(
+            "feature_type", data=np.asarray(feature_types, dtype=object), dtype=dt
+        )
+
+    print(f"Done: {h5_path}")
+
+if __name__ == "__main__":
+    zarr_to_10x_h5(
+        r"D:\Downloads\cervical atera zarr\cell_features",
+        r"D:\Downloads\h5s\cervical_expression_matrix.h5",
+    )
+    inspect_zarr(r"D:\Downloads\cervical atera zarr\cell_features")
+    print_h5_tree(r"D:\Downloads\h5s\cervical_expression_matrix atera.h5")
+    zarr_to_h5(
+        r"D:\Downloads\cervical atera zarr\cell_features",
+        r"D:\Downloads\h5s\cervical_expression_matrix.h5",
+    )

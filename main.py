@@ -38,7 +38,7 @@ mpl.use("qtagg")
 App = QApplication.instance() or QApplication(sys.argv)
 editor = None
 
-DATA_DIR = Path(r"C:\Users\bend2\Documents\PROJECTS\aterads test")
+DATA_DIR = Path(r"C:\Users\bend2\OneDrive\Documents\CFCE")
 
 
 def delete_file(fp):
@@ -299,6 +299,7 @@ def format_h5(tc_associations):
     """).df()
 
     feature_names = unique_values["feature_name"].tolist()
+    feature_ids = feature_names  # placeholder until a real ID column exists
 
     feature_index = {
         gene: i
@@ -309,14 +310,12 @@ def format_h5(tc_associations):
 
     h5_file = DATA_DIR / "tmp" / "cell_matrix.h5"
 
-
     # Build CSC arrays
-
 
     data = []
     indices = []
     indptr = [0]
-    column_names = []
+    barcodes = []
 
     last_cell = None
     genes_in_cell = []
@@ -329,7 +328,8 @@ def format_h5(tc_associations):
 
         counts = Counter(genes_in_cell)
 
-        # store only nonzero entries
+        # store only nonzero entries, sorted by feature row index
+        # (10x expects indices within each column to be sorted ascending)
         for gene, count in sorted(
             counts.items(),
             key=lambda x: feature_index[x[0]]
@@ -338,7 +338,7 @@ def format_h5(tc_associations):
             data.append(count)
 
         indptr.append(len(data))
-        column_names.append(str(cell_id))
+        barcodes.append(str(cell_id))
 
         processed += 1
 
@@ -348,9 +348,7 @@ def format_h5(tc_associations):
                 f"({processed/TOTAL_CELLS:.1%})"
             )
 
-
     # Iterate through parquet
-
 
     for rg in range(num_row_groups):
 
@@ -375,49 +373,65 @@ def format_h5(tc_associations):
     if last_cell is not None:
         finish_cell(last_cell)
 
-    # Save CSC matrix
+    # Save CSC matrix in 10x Genomics H5 layout
 
     dt = h5py.string_dtype("utf-8")
 
     with h5py.File(h5_file, "w") as f:
 
-        counts = f.create_group("counts")
+        matrix = f.create_group("matrix")
 
-        counts.create_dataset(
+        matrix.create_dataset(
             "data",
-            data=np.asarray(data, dtype=np.uint16),
+            data=np.asarray(data, dtype=np.int32),
             compression="gzip"
         )
 
-        counts.create_dataset(
+        matrix.create_dataset(
             "indices",
-            data=np.asarray(indices, dtype=np.uint32),
+            data=np.asarray(indices, dtype=np.int32),
             compression="gzip"
         )
 
-        counts.create_dataset(
+        matrix.create_dataset(
             "indptr",
-            data=np.asarray(indptr, dtype=np.uint64),
+            data=np.asarray(indptr, dtype=np.int32),
             compression="gzip"
         )
 
-        counts.create_dataset(
+        matrix.create_dataset(
             "shape",
             data=np.array(
-                [len(feature_names), len(column_names)],
-                dtype=np.uint64
+                [len(feature_names), len(barcodes)],
+                dtype=np.int32
             )
         )
 
-        f.create_dataset(
-            "row_names",
+        matrix.create_dataset(
+            "barcodes",
+            data=np.asarray(barcodes, dtype=object),
+            dtype=dt
+        )
+
+        features = matrix.create_group("features")
+
+        features.create_dataset(
+            "id",
+            data=np.asarray(feature_ids, dtype=object),
+            dtype=dt
+        )
+
+        features.create_dataset(
+            "name",
             data=np.asarray(feature_names, dtype=object),
             dtype=dt
         )
 
-        f.create_dataset(
-            "column_names",
-            data=np.asarray(column_names, dtype=object),
+        features.create_dataset(
+            "feature_type",
+            data=np.asarray(
+                ["Gene Expression"] * len(feature_names), dtype=object
+            ),
             dtype=dt
         )
 
@@ -1118,7 +1132,7 @@ def total_count_scatter():
     fig.show(config={'scrollZoom': True})
 if __name__ == "__main__":
     #assign_gene_to_cell(DATA_DIR / "transcripts.parquet", DATA_DIR / "cell_boundaries.parquet")
-    #format_h5(r"D:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\trns_with_cellID.parquet")
+    #format_h5(DATA_DIR / "tmp" / "trns_with_cellID_regroup.parquet")
     #create_UMAP(r"F:\SPSC-RNA-Seq\WTA_Preview_FFPE_Breast_Cancer_outs\tmp\cell_matrix.h5",view_plots=False)
     #diff_analysis(view_plots=True, save_plots=True)
 
