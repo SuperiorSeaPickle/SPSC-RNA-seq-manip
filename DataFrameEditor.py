@@ -1,8 +1,6 @@
-import sys
 import pandas as pd
 
 from PyQt6.QtWidgets import (
-    QApplication,
     QSlider,
     QLabel,
     QDialog,
@@ -13,20 +11,52 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QInputDialog,
     QFileDialog,
-    QMenu,
-    QMainWindow
+    QFormLayout,
+    QLineEdit,
+    QCheckBox,
+    QDialogButtonBox
 )
 
 from PyQt6.QtGui import QColor, QAction
 
-from PyQt6.QtCore import pyqtSignal, Qt, QTimer, QEvent
+from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 import pickle
 
+class ColumnAttributesDialog(QDialog):
+
+    def __init__(self, old_name, was_checked, parent=None):
+        super().__init__(parent)
+
+        self.setWindowTitle("Column Attributes")
+
+        # Pass self so this becomes the dialog's root layout
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        self.name_input = QLineEdit(old_name)
+        form_layout.addRow("Annotation Name:", self.name_input)
+
+        self.tumor_toggle = QCheckBox()
+        self.tumor_toggle.setChecked(was_checked)
+        form_layout.addRow("Is Tumor:", self.tumor_toggle)
+
+        # Use addLayout instead of addChildLayout
+        layout.addLayout(form_layout)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)        
+
 class DFE_data():
-    def __init__(self,df: pd.DataFrame, threshes: dict) -> None:
+    def __init__(self,df: pd.DataFrame, threshes: dict, healthy_toggles: dict) -> None:
         self.df = df
         self.col_meta = {}
         self.col_meta['thresholds'] = threshes
+        self.col_meta['is_tumor'] = healthy_toggles
 
     def save(self, file_path):
         print("Saving:")
@@ -65,6 +95,11 @@ class DataFrameEditor(QDialog):
 
         self.column_thresholds = {
             str(col): thresh for col in self.df.columns
+        }
+
+
+        self.column_health_status = {
+            str(col): False for col in self.df.columns
         }
 
         self.active_column = None
@@ -334,22 +369,35 @@ class DataFrameEditor(QDialog):
     # Rename a column by double-clicking its header
 
     def rename_column(self, column):
-
         item = self.table.horizontalHeaderItem(column)
-
         assert item is not None
         old_name = item.text()
+        was_checked = self.column_health_status[old_name]
 
-        new_name, ok = QInputDialog.getText(
-            self,
-            "Rename Column",
-            "Column name:",
-            text=old_name
-        )
-        
-        if ok and new_name:
-            self.column_thresholds[new_name] = self.column_thresholds.pop(old_name)
+        dialog = ColumnAttributesDialog(old_name, was_checked , parent=self)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_name = dialog.name_input.text()
+            is_tumor = dialog.tumor_toggle.isChecked()
+
+            if new_name:
+                # 1. Update threshold dictionary safely (checking both str and int keys)
+                if old_name in self.column_thresholds:
+                    val = self.column_thresholds.pop(old_name)
+                else:
+                    val = self.thresh  # Fallback to default threshold if key missing
+
+                self.column_thresholds[new_name] = val
+
+            # 2. Update health status (outside new_name != old_name check so toggling works!)
+            self.column_health_status[new_name] = is_tumor
+
+            # 3. Update header UI
             item.setText(new_name)
+
+            text_color = QColor("#D32F2F") if is_tumor else QColor("#000000")
+            item.setForeground(text_color)
+            item.setToolTip("Healthy" if not is_tumor else "Unhealthy / Warning")
 
     def close_ok(self):
 
@@ -398,7 +446,7 @@ class DataFrameEditor(QDialog):
 
         return pd.DataFrame(data, columns=headers)
     def save_file(self):
-        config = DFE_data(self.get_dataframe(), self.column_thresholds)
+        config = DFE_data(self.get_dataframe(), self.column_thresholds, self.column_health_status)
         # Open native cross-platform save dialog
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -412,7 +460,7 @@ class DataFrameEditor(QDialog):
             config.save(file_path)
 
     def load_file(self):
-        loaded_config = DFE_data(pd.DataFrame(), {})
+        loaded_config = DFE_data(pd.DataFrame(), {}, {})
         # Open native cross-platform open dialog
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -426,7 +474,15 @@ class DataFrameEditor(QDialog):
             self.table.blockSignals(True)
             loaded_config.load(file_path)
             self.df = loaded_config.df
-            self.column_thresholds = loaded_config.col_meta['thresholds']
+            try:
+                self.column_thresholds = loaded_config.col_meta['thresholds']
+            except:
+                print("key DNE")
+            try:
+                self.column_health_status = loaded_config.col_meta['healthy_toggles']
+            except:
+                self.column_health_status = dict.fromkeys(self.column_thresholds, False)
+                print("key DNE")
 
             print(loaded_config.df)
             print(self.df)

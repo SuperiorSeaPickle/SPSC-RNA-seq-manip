@@ -38,7 +38,7 @@ mpl.use("qtagg")
 App = QApplication.instance() or QApplication(sys.argv)
 editor = None
 
-DATA_DIR = Path(r"C:\Users\bend2\OneDrive\Documents\CFCE")
+DATA_DIR = Path(r"C:\Users\bend2\Documents\PROJECTS\aterads test")
 
 
 def delete_file(fp):
